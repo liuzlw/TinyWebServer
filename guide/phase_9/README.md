@@ -27,6 +27,7 @@
 | **cmake** | Release 构建、`-O2`/`-O3` 优化选项 |
 | **gdb** | `core dump` 分析：`ulimit -c`、`bt full` |
 | **WebBench** | 编译、压测、解读输出 |
+| **perf** | 火焰图采样、CPU 热点分析 |
 
 ---
 
@@ -109,14 +110,17 @@ cmake --build build_release -j$(nproc)
 | ET+LT | | | | |
 | ET+ET | | | | |
 
-**预期结果（本项目的数据）：**
+**预期结果（本项目在 Ubuntu 16.04, 关闭日志, Release 构建下的数据）：**
 
-| 模式 (Proactor) | QPS |
-|----------------|------|
-| LT + LT | ~13251 |
-| LT + ET | ~27459 |
-| ET + LT | ~30498 |
-| ET + ET | ~32167 |
+| 模式 | QPS |
+|------|------|
+| Proactor, LT + LT | ~93251 |
+| Proactor, LT + ET | ~97459 |
+| Proactor, ET + LT | ~80498 |
+| Proactor, ET + ET | ~92167 |
+| Reactor, LT + ET | ~69175 |
+
+> ⚠️ **数据说明：** 以上数据来自 Release 构建（`-O2`）+ 关闭日志（`-c 1`）+ 10500 并发连接压测 5 秒。Debug 模式（`-O0 -g`）+ 开启日志时 QPS 会大幅下降（约 1/3 ~ 1/7），属于正常现象。建议压测时统一用 Release 构建。
 
 **分析：** ET 模式比 LT 快，因为内核不会重复通知已就绪的 fd，减少了 `epoll_wait` 的唤醒次数和上下文切换。connfd 用 ET 的收益比 listenfd 大，因为 connfd 数量远多于 listenfd。
 
@@ -216,7 +220,56 @@ strace -c ./build_release/server -c 1 &> /dev/null &
 
 这可以帮助你发现哪些系统调用是瓶颈。如果 `write` / `writev` 占比很高，说明响应发送是瓶颈。
 
-### Step 9：性能优化清单
+### Step 9：火焰图（CPU 热点分析）
+
+`strace -c` 只能看到系统调用级别的统计，而 **perf** 工具可以采样 CPU 正在执行的代码路径，生成火焰图——直观展示 CPU 时间"烧"在哪里。
+
+```bash
+# 安装 perf（Ubuntu）
+sudo apt install linux-tools-common linux-tools-generic
+
+# 启动服务器
+./build_release/server -c 1
+
+# 另一个终端：采样 10 秒
+perf record -p $(pgrep server) -g -- sleep 10
+perf report                    # 交互式查看热点
+```
+
+**如何看 perf report 输出：**
+
+```
+# Samples: 10K of event 'cycles'
+# Overhead  Command      Shared Object        Symbol
+# ........  ...........  ...................   ....................
+    45.23%  server       server                [.] http_conn::process_read
+    30.12%  server       [kernel]              [k] epoll_wait
+    12.34%  server       server                [.] http_conn::write
+     5.67%  server       libc-2.31.so          [.] __memcpy_avx_unaligned
+```
+
+**火焰图可视化（更直观）：**
+
+```bash
+# 安装 FlameGraph 工具集
+git clone https://github.com/brendangregg/FlameGraph
+cd FlameGraph
+
+# 生成火焰图 SVG
+perf script -i /path/to/perf.data | ./stackcollapse-perf.pl | ./flamegraph.pl > server_flame.svg
+# 用浏览器打开 server_flame.svg
+```
+
+火焰图中的每个矩形代表一个函数调用栈帧，宽度表示 CPU 采样占比。**越宽的函数越值得优化。** 典型瓶颈模式：
+
+| 火焰图特征 | 含义 | 优化方向 |
+|-----------|------|---------|
+| `epoll_wait` 顶很宽 | IO 等待型，CPU 空转等待网络 | 增加并发连接数 |
+| `process_read` 很宽 | HTTP 解析是瓶颈 | 优化字符串操作、减少拷贝 |
+| `__memcpy` 很宽 | 内存拷贝消耗大 | 检查是否用了 mmap/writev |
+| 锁相关函数很宽 | 锁竞争激烈 | 减少临界区、改用读写锁 |
+
+### Step 10：性能优化清单
 
 | 优化项 | 效果 | 复杂度 |
 |--------|------|--------|
@@ -280,6 +333,68 @@ strace -c ./build_release/server -c 1 &> /dev/null &
 
 ---
 
+## 附录：现代 C++ (C++11/14/17) 替代方案
+
+本教程使用 POSIX pthread 系列 API 教学，因为它们在 Linux 上是"底层事实标准"，适合理解操作系统原理。但在现代 C++ 项目中，标准库提供了更安全、更简洁的替代品。
+
+### 对照表
+
+| 本教程方案 | C++ 标准替代 | 优势 |
+|-----------|-------------|------|
+| `pthread_mutex_t` + `locker` 封装 | `std::mutex` + `std::lock_guard` | 不用手动 unlock，异常安全 |
+| `sem_t` | `std::counting_semaphore` (C++20) | 类型安全，RAII 友好 |
+| `pthread_cond_t` + `cond` 封装 | `std::condition_variable` | 与 `std::unique_lock` 配合更自然 |
+| `pthread_create` + `pthread_detach` | `std::thread` + `detach()` | 面向对象，无需 C 函数指针适配 |
+| 手动线程池 (`pthread_t` 数组 + 任务队列) | `std::async` / `std::thread_pool` (C++26 TS) | 返回值通过 `std::future` 获取 |
+| `pthread_once` 或手动 double-check | `std::call_once` + `std::once_flag` | 保证只执行一次，无竞态 |
+| `volatile` 标志 | `std::atomic<T>` | 正确的内存序语义，防止编译器重排 |
+
+### 迁移示例：locker.h → C++11
+
+**原 pthread 版本（`locker.h`）：**
+```cpp
+class locker {
+    pthread_mutex_t m_mutex;
+public:
+    locker() { pthread_mutex_init(&m_mutex, NULL); }
+    ~locker() { pthread_mutex_destroy(&m_mutex); }
+    bool lock() { return pthread_mutex_lock(&m_mutex) == 0; }
+    bool unlock() { return pthread_mutex_unlock(&m_mutex) == 0; }
+};
+```
+
+**C++11 版本：**
+```cpp
+#include <mutex>
+class locker {
+    std::mutex m_mutex;
+public:
+    void lock() { m_mutex.lock(); }
+    void unlock() { m_mutex.unlock(); }
+    std::mutex& get() { return m_mutex; }
+};
+// 使用 lock_guard 自动管理锁生命周期
+// std::lock_guard<std::mutex> guard(mtx);
+```
+
+### 迁移示例：线程池
+
+核心变化：`pthread_create` 传入静态函数指针的黑魔法 → `std::thread` 直接绑定成员函数。
+
+```cpp
+// C++11 线程池核心部分
+std::vector<std::thread> m_threads;
+
+for (int i = 0; i < thread_number; ++i) {
+    m_threads.emplace_back([this]() { this->run(); });
+    m_threads.back().detach();
+}
+```
+
+> **练习建议：** 在理解本教程的 pthread 实现后，尝试用 C++11 标准库重写 `locker.h`、`threadpool.h` 和 `log.cpp`。这会加深你对两种方案的理解。
+
+---
+
 ## 阶段小结
 
 **这是最后一个阶段。** 你完成了从环境搭建到性能调优的完整 C++ Web 服务器之旅。
@@ -295,7 +410,7 @@ strace -c ./build_release/server -c 1 &> /dev/null &
 
 **下一步建议：**
 - 阅读《Unix 网络编程》（Stevens）深入理解网络协议栈
-- 尝试用 C++11 的 `std::thread`、`std::mutex` 等替换 pthread
+- 尝试用 C++11 标准库重构本项目的同步原语和线程池（见附录）
 - 将定时器从链表升级为时间轮（timer wheel）
-- 支持 HTTPS（用 OpenSSL）
+- 支持 HTTPS（用 OpenSSL 或 GnuTLS）
 

@@ -332,6 +332,26 @@ close(fd);
 
 4. **`listen` 的 backlog。** 并不是连接数的上限。实际最大连接数受 `somaxconn` 内核参数控制：`cat /proc/sys/net/core/somaxconn`。
 
+5. **`send()` 可能只发送部分数据（短写）。** 本阶段 echo 服务器直接在 EPOLLIN 分支调 `send(fd, buf, n, 0)`。当客户端消费慢或发送缓冲区满时，`send` 返回的字节数可能少于 `n`（非阻塞 socket 下返回 -1，`errno = EAGAIN`）。未被发送的数据会丢失。**生产环境正确处理方式：**
+   ```cpp
+   // 1. 每次 send 后检查返回值，记录已发送偏移
+   int total = 0;
+   while (total < n) {
+       int ret = send(fd, buf + total, n - total, 0);
+       if (ret == -1) {
+           if (errno == EAGAIN) {
+               // 2. 未发完的数据缓存到应用层缓冲区
+               // 3. 注册 EPOLLOUT 事件
+               // 4. 在 EPOLLOUT 回调中继续发送
+               break;
+           }
+           // 真正的错误
+           break;
+       }
+       total += ret;
+   }
+   ```
+
 ---
 
 ## 阶段小结

@@ -422,6 +422,44 @@ cmake --build build
 
 ---
 
+## 安全注意事项（进阶阅读）
+
+本项目的定位是教学演示，以下是生产环境部署前必须关注的安全问题：
+
+### SQL 注入
+
+`do_request` 中直接将用户输入拼接到 SQL 语句：
+
+```cpp
+char sql_insert[200];
+sprintf(sql_insert, "INSERT INTO user(username, passwd) VALUES('%s', '%s')", name, password);
+mysql_query(mysql, sql_insert);
+```
+
+如果用户输入 `admin' OR '1'='1`，SQL 语义就被篡改了。**防护：** 使用 `mysql_real_escape_string` 转义特殊字符，或使用 MySQL 预处理语句（Prepared Statement）。
+
+### 路径穿越
+
+URL 中的 `..` 可能让攻击者访问服务器上任意文件：
+
+```
+GET /../../../etc/passwd HTTP/1.1
+```
+
+**防护：** 在 `do_request` 中拒绝包含 `..` 的 URL，或用 `realpath()` 规范化后检查前缀是否为 `doc_root`。
+
+### 缓冲区溢出
+
+多处使用 `strcpy`、`sprintf` 没有边界检查。**防护：** 全部替换为 `strncpy`、`snprintf` 并检查返回值。
+
+### 其他常见问题
+
+- **无 HTTPS：** 密码在网络上明文传输。生产环境应使用 TLS/SSL。
+- **无速率限制：** 攻击者可暴力破解登录。应增加 IP 级别的失败计数和限流。
+- **无输入长度限制：** 用户名/密码无最大长度限制，可导致服务资源耗尽。
+
+---
+
 ## 踩坑记录
 
 1. **`getcwd` 获取工作目录。** `m_root` 是 `getcwd() + "/root"`，确保你从项目根目录启动服务器（`./build/server`，不是 `cd build && ./server`）。
@@ -432,7 +470,24 @@ cmake --build build
 
 4. **`server_path` 数组太小。** 路径太长会截断，确保 `char server_path[200]` 足够容纳完整路径。
 
-5. **Proactor 模式下的 `improv` 自旋。** `dealwithread` 中的 `while (users[sockfd].improv != 1)` 是忙等（busy-wait），会浪费 CPU。这是简化实现，生产环境应该用条件变量或回调。
+5. **Proactor 模式下的 `improv` 自旋。** `dealwithread` 中的 `while (users[sockfd].improv != 1)` 是忙等（busy-wait），会浪费 CPU。这是简化实现，生产环境应该用条件变量或回调替代：
+
+   **方案一（条件变量）：** 主线程在 `improv` 上 `cond.wait()`，工作线程处理完后 `cond.signal()`。
+
+   **方案二（回调+事件驱动）：** 工作线程处理完后通过 `eventfd` 通知主线程，主线程在 epoll 中监听 eventfd，无需自旋。
+
+   ```cpp
+   // 方案一的伪代码示例
+   // 主线程 dealwithread 中：
+   m_mutex.lock();
+   if (users[sockfd].improv != 1)
+       m_cond.wait(m_mutex.get());  // 休眠，不占 CPU
+   m_mutex.unlock();
+
+   // 工作线程 run() 中处理完后：
+   request->improv = 1;
+   m_cond.signal();  // 唤醒主线程
+   ```
 
 ---
 

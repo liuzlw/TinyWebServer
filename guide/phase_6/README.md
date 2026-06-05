@@ -365,17 +365,44 @@ HTTP_CODE http_conn::do_request() {
 
     // --- POST 注册/登录 ---
     if (cgi == 1 && (*(p + 1) == '2' || *(p + 1) == '3')) {
-        char name[100], password[100];
-        int i;
-        // 解析 POST body："user=xxx&passwd=yyy"
-        for (i = 5; m_string[i] != '&'; ++i)
-            name[i - 5] = m_string[i];
-        name[i - 5] = '\0';
+        char name[100] = {0}, password[100] = {0};
 
-        int j = 0;
-        for (i = i + 10; m_string[i] != '\0'; ++i, ++j)
-            password[j] = m_string[i];
-        password[j] = '\0';
+        // 解析 POST body："user=xxx&passwd=yyy"
+        // 用通用 key-value 方式解析，而不是硬编码偏移量
+        char *cur = m_string, *next;
+        while (cur && *cur) {
+            // 跳过开头的空白
+            while (*cur == ' ' || *cur == '\t') cur++;
+
+            // 找下一个 & 或结束
+            next = strchr(cur, '&');
+            if (!next) next = cur + strlen(cur);
+
+            // 找 = 号分隔 key 和 value
+            char* eq = strchr(cur, '=');
+            if (eq && eq < next) {
+                size_t key_len = eq - cur;
+                size_t val_len = next - eq - 1;
+
+                if (key_len >= 100 || val_len >= 100) {
+                    // 安全保护：长度超限跳过（生产环境应返回 BAD_REQUEST）
+                    cur = (*next) ? next + 1 : NULL;
+                    continue;
+                }
+
+                if (strncmp(cur, "user", key_len) == 0) {
+                    strncpy(name, eq + 1, val_len);
+                    name[val_len] = '\0';
+                } else if (strncmp(cur, "passwd", key_len) == 0) {
+                    strncpy(password, eq + 1, val_len);
+                    password[val_len] = '\0';
+                }
+            }
+            cur = (*next) ? next + 1 : NULL;
+        }
+
+        // 注意：生产环境中应对 name/password 做 URL 解码（把 %XX 转成原始字符）
+        // 以及用 mysql_real_escape_string 防止 SQL 注入
 
         if (*(p + 1) == '3') {
             // 注册
@@ -588,6 +615,18 @@ curl -v http://127.0.0.1:9006/xxx.html    # 应返回 404
    int http_conn::m_epollfd = -1;
    int http_conn::m_user_count = 0;
    ```
+
+5. **POST body 解析不要硬编码偏移量。** 用 `user=xxx&passwd=yyy` 格式时，不要假设 key 的长度固定（如 `for (i = 5; ...)`）。应当用 `strchr('=')` + `strncmp` 做通用 key-value 解析（本教程已采用改进版本）。另外，生产环境还需做 URL 解码（`%XX` → 原始字符）。
+
+6. **`Content-Length` 缺失时怎么办。** HTTP/1.1 还支持 `Transfer-Encoding: chunked`（分块传输），本教程未实现。如果收到没有 `Content-Length` 的 POST 请求，`m_content_length` 默认为 0，解析会直接进入 GET 分支。生产环境需要处理 `chunked` 编码。
+
+7. **不支持 HTTP Pipelining。** HTTP/1.1 keep-alive 允许在同一个连接上连续发送多个请求而不等响应（Pipelining）。本项目的 keep-alive 实现是串行的——必须等当前请求的响应完成后才能处理下一个请求。这是简化设计，生产级服务器需要支持请求队列和乱序响应。
+
+8. **路径穿越风险。** `do_request` 中把 URL 直接拼到文件路径上：
+   ```cpp
+   strncpy(m_real_file + len, m_url, FILENAME_LEN - len - 1);
+   ```
+   恶意请求 `GET /../../../etc/passwd HTTP/1.1` 可能读到系统文件。**防护方法：** 在拼接前检查 `m_url` 中是否包含 `..`，或使用 `realpath()` 规范化路径后验证前缀。
 
 ---
 

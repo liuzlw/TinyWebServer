@@ -215,10 +215,10 @@ private:
 };
 
 // 四个级别的日志宏
-#define LOG_DEBUG(format, ...) if(m_close_log == 0) { Log::get_instance()->write_log(0, format, ##__VA_ARGS__); }
-#define LOG_INFO(format, ...)  if(m_close_log == 0) { Log::get_instance()->write_log(1, format, ##__VA_ARGS__); }
-#define LOG_WARN(format, ...)  if(m_close_log == 0) { Log::get_instance()->write_log(2, format, ##__VA_ARGS__); }
-#define LOG_ERROR(format, ...) if(m_close_log == 0) { Log::get_instance()->write_log(3, format, ##__VA_ARGS__); }
+#define LOG_DEBUG(format, ...) do { if(m_close_log == 0) Log::get_instance()->write_log(0, format, ##__VA_ARGS__); } while(0)
+#define LOG_INFO(format, ...)  do { if(m_close_log == 0) Log::get_instance()->write_log(1, format, ##__VA_ARGS__); } while(0)
+#define LOG_WARN(format, ...)  do { if(m_close_log == 0) Log::get_instance()->write_log(2, format, ##__VA_ARGS__); } while(0)
+#define LOG_ERROR(format, ...) do { if(m_close_log == 0) Log::get_instance()->write_log(3, format, ##__VA_ARGS__); } while(0)
 
 #endif
 ```

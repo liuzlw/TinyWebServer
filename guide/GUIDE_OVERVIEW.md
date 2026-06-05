@@ -118,6 +118,7 @@ Phase 0    Phase 1    Phase 2    Phase 3    Phase 4    Phase 5    Phase 6    Pha
 - WebServer 主类串联所有模块
 - 命令行参数解析
 - 注册/登录 + 静态文件服务
+- 🔒 安全注意事项：SQL 注入、路径穿越防护
 
 **产出：** 浏览器访问完整 Web 服务。
 
@@ -129,6 +130,8 @@ Phase 0    Phase 1    Phase 2    Phase 3    Phase 4    Phase 5    Phase 6    Pha
 - ET/LT 四种组合性能对比
 - Reactor / Proactor 模式对比
 - core dump 分析
+- perf 火焰图 CPU 热点分析
+- 📖 附录：C++11 现代替代方案（std::thread、std::mutex 等对照）
 
 **产出：** 上万 QPS 并发连接 + 性能分析报告。
 

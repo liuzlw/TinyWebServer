@@ -135,6 +135,8 @@ cmake --build build
 - `set(CMAKE_CXX_STANDARD 11)`：使用 C++11
 - `add_executable`：定义可执行目标及其源文件
 
+> **💡 快捷方式：** 本项目根目录提供了 `build.sh` 一键构建脚本，内部等价于执行 `cmake -B build && cmake --build build`。后续阶段可以直接 `sh build.sh` 完成编译。
+
 ### Step 5：gdb 调试入门
 
 编译时加 `-g` 保留调试信息：
