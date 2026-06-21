@@ -1,505 +1,448 @@
-﻿# Phase 8 —— 服务集成
+# Phase 8 —— 服务集成：组装完整 Web 服务器
 
-## 目标
+## 本阶段目标
 
-将 Phase 1-7 的所有模块串联成一个完整的 Web 服务器，支持：
-- 命令行参数配置（端口、日志模式、触发模式等）
-- 静态文件服务（HTML、图片、视频）
-- 用户注册 / 登录（POST → MySQL）
-- Reactor / Proactor 两种并发模型
-- LT / ET 四种触发组合
+将 Phase 1-7 的所有模块串联成一个完整的 Web 服务器。
 
-**可见结果：** 浏览器访问 `http://ip:port/`，看到一个完整的 Web 服务——注册页面 → 注册 → 登录 → 欢迎页 → 浏览图片/视频。
+**可见结果：** 浏览器访问 `http://服务器IP:9006/`，看到完整的 Web 服务：
 
----
+1. 首页是判断页面（judge.html），可以选择注册或登录
+2. 注册 → 用户名密码写入 MySQL → 跳转登录页
+3. 登录 → 验证用户名密码 → 跳转欢迎页
+4. 可以请求图片和视频文件（通过静态文件服务）
 
-## 前置知识
+**验收标准：**
 
-- Phase 1-7 所有模块
-- Phase 0 的 cmake 基础
-
----
-
-## 工具聚焦
-
-| 工具 | 本次学什么 |
-|------|-----------|
-| **cmake** | 最终项目 CMakeLists.txt 全局整合：include_directories、ind_library、所有源文件归并到一个 target |
-| **strace** | 追踪完整请求链路中的系统调用序列 |
+- [ ] 浏览器访问首页，显示 judge.html
+- [ ] 注册新用户成功，数据库 user 表中有新记录
+- [ ] 用刚注册的用户登录成功，跳转 welcome.html
+- [ ] 访问 `/picture.html` 能看到图片
+- [ ] 访问 `/video.html` 能播放视频
+- [ ] 用不存在的用户登录，显示错误页面
+- [ ] 所有参数可以通过命令行配置（端口、线程数、日志模式等）
 
 ---
 
-## 分步实现
+## 理论与机制
 
-### Step 1：`WebServer` 主类设计
+### 1. 整体架构
+
+```
+                          ┌──────────────────────────┐
+                          │      WebServer (主控)      │
+                          │   main.cpp → webserver.cpp │
+                          └──────────┬───────────────┘
+                                     │
+          ┌──────────────────────────┼──────────────────────────┐
+          │                          │                          │
+    ┌─────▼─────┐            ┌──────▼──────┐            ┌──────▼──────┐
+    │  监听线程  │            │  epoll 循环   │            │   线程池     │
+    │ (eventListen)│          │ (eventLoop)  │            │ (threadpool) │
+    └───────────┘            └──────┬───────┘            └──────┬──────┘
+                                    │                           │
+                    ┌───────────────┼───────────────┐          │
+                    │               │               │          │
+              ┌─────▼─────┐  ┌─────▼─────┐  ┌─────▼─────┐    │
+              │ 新连接     │  │ 可读事件  │  │ 可写事件  │    │
+              │ accept    │  │ EPOLLIN   │  │ EPOLLOUT  │    │
+              └─────┬─────┘  └─────┬─────┘  └─────┬─────┘    │
+                    │              │               │          │
+              ┌─────▼─────┐  ┌─────▼─────┐  ┌─────▼─────┐    │
+              │ 创建定时器 │  │ read_once │  │  write()  │    │
+              │ timer()   │  │ + process │  │ 写响应    │    │
+              └───────────┘  └─────┬─────┘  └───────────┘    │
+                                   │                          │
+                            ┌──────▼──────┐            ┌──────▼──────┐
+                            │ HTTP 状态机  │            │  工作线程    │
+                            │ parse/proc  │◄───────────│  run()      │
+                            └──────┬──────┘            └──────┬──────┘
+                                   │                          │
+                            ┌──────▼──────┐                   │
+                            │ MySQL 连接池 │◄──────────────────┘
+                            │ (RAII 获取) │
+                            └─────────────┘
+```
+
+### 2. 请求处理全链路
+
+一次完整的 HTTP 请求在系统中的生命周期：
+
+```
+1. 浏览器发起 TCP 连接
+   ↓ TCP 三次握手 (内核完成)
+2. listenfd 变为可读 → epoll_wait 返回
+   ↓
+3. dealclientdata() → accept() → 创建 connfd → 注册 epoll
+   ↓ 同时创建定时器(3×TIMESLOT 秒超时)
+4. 浏览器发送 HTTP 请求
+   ↓
+5. connfd 变为可读 → epoll_wait 返回
+   ↓
+6. dealwithread(sockfd)
+   ↓ 
+7. 根据 actor_model 选择路径:
+   
+   【Proactor 路径】(默认)
+   7a. 主线程: read_once() 读全部数据
+   7b. 主线程: m_pool->append_p() 投递到线程池
+   7c. 工作线程: process() → process_read() → do_request() → process_write()
+   7d. 工作线程: 完成后 modfd(EPOLLOUT)
+   
+   【Reactor 路径】
+   7a. 主线程: m_pool->append(users+sockfd, 0) 投递到线程池
+   7b. 工作线程: read_once() 读数据
+   7c. 工作线程: process() 解析 + 生成响应
+   7d. 主线程: 等待 improv 标志 → modfd(EPOLLOUT)
+
+8. connfd 变为可写 → epoll_wait 返回
+   ↓
+9. dealwithwrite(sockfd) → write() → writev 发送响应头+文件
+   ↓
+10. 如果 keep-alive: modfd(EPOLLIN) 重新读 → 回到步骤 4
+    如果 close: close_conn() → removefd → 连接关闭
+```
+
+### 3. Proactor vs Reactor：核心区别
+
+这是本项目最常被问到的设计抉择：
+
+| | Proactor (默认) | Reactor |
+|---|---|---|
+| **谁读数据** | 主线程读（IO 操作在主线程） | 工作线程读（IO 操作在工作线程） |
+| **主线程职责** | IO 操作 + 事件分发 | 只做事件分发 |
+| **工作线程职责** | 纯粹的业务逻辑处理 | IO 操作 + 业务逻辑 |
+| **优点** | IO 集中，易优化；工作线程纯粹 | 主线程轻量，不会被 IO 阻塞 |
+| **缺点** | 主线程负担重 | 工作线程会被 IO 阻塞 |
+| **线程池入口** | `append_p()` — 数据已读好 | `append()` — 需要自己读 |
+
+**主循环中的体现（`dealwithread`）：**
 
 ```cpp
-// webserver.h
+// Proactor: 主线程读 + 投递
+if (users[sockfd].read_once()) {
+    m_pool->append_p(users + sockfd);  // 数据已读好
+}
+
+// Reactor: 只投递，工作线程自己读
+m_pool->append(users + sockfd, 0);  // 0 = 读状态
+```
+
+---
+
+## 实现指南
+
+### Step 1：WebServer 主类
+
+```cpp
 class WebServer {
 public:
-    WebServer();
-    ~WebServer();
+    void init(...);           // 初始化所有参数
+    void eventListen();       // socket/bind/listen/epoll 创建
+    void eventLoop();         // 主事件循环（epoll_wait + 分发）
+    void dealclientdata();    // 处理新连接（accept）
+    void dealwithread(int);   // 处理可读事件
+    void dealwithwrite(int);  // 处理可写事件
+    void dealwithsignal();    // 处理信号（SIGALRM → tick）
+    void timer(int, sockaddr_in); // 为新连接创建定时器
 
-    // 初始化：设置参数
-    void init(int port, string user, string passwd, string dbname,
-              int log_write, int opt_linger, int trigmode,
-              int sql_num, int thread_num, int close_log, int actor_model);
-
-    // 六大初始化步骤（对应 main 中的调用顺序）
-    void log_write();       // 1. 日志
-    void sql_pool();        // 2. 数据库连接池
-    void thread_pool();     // 3. 线程池
-    void trig_mode();       // 4. 触发模式
-    void eventListen();     // 5. 监听：socket + epoll + 信号
-    void eventLoop();       // 6. 主循环：epoll_wait → 事件分发
-
-    // 事件处理
-    void timer(int connfd, sockaddr_in client_addr);
-    void adjust_timer(util_timer* timer);
-    void deal_timer(util_timer* timer, int sockfd);
-    bool dealclientdata();                          // 处理新连接
-    bool dealwithsignal(bool& timeout, bool& stop); // 处理信号
-    void dealwithread(int sockfd);                  // 处理读事件
-    void dealwithwrite(int sockfd);                 // 处理写事件
-
-    // 成员变量（略，见 web_conn_detail.h）
+    // 模块初始化
+    void log_write();         // 初始化日志
+    void sql_pool();          // 初始化数据库连接池
+    void thread_pool();       // 初始化线程池
+    void trig_mode();         // 设置 LT/ET 模式
+    
+    // 核心成员
+    int m_listenfd;           // 监听 socket
+    int m_epollfd;            // epoll 实例
+    int m_pipefd[2];          // 信号管道（socketpair）
+    http_conn *users;         // 所有连接的数组（预分配 MAX_FD 个）
+    client_data *users_timer; // 所有连接的定时器数据
+    threadpool<http_conn> *m_pool; // 线程池
+    connection_pool *m_connPool;   // 数据库连接池
+    Utils utils;              // 工具类（定时器链表、fd 操作）
 };
 ```
 
-### Step 2：`Config` 命令行参数解析
+### Step 2：main.cpp 中的 6 步启动流程
 
 ```cpp
-// config.h
-class Config {
-public:
-    Config();
-    void parse_arg(int argc, char* argv[]);
-
-    int PORT;           // 默认 9006
-    int LOGWrite;       // 0=同步, 1=异步
-    int TRIGMode;       // 0=LT+LT, 1=LT+ET, 2=ET+LT, 3=ET+ET
-    int OPT_LINGER;     // 0=否, 1=是
-    int sql_num;        // 默认 8
-    int thread_num;     // 默认 8
-    int close_log;      // 0=开, 1=关
-    int actor_model;    // 0=Proactor, 1=Reactor
-};
-```
-
-```cpp
-// config.cpp
-void Config::parse_arg(int argc, char* argv[]) {
-    int opt;
-    const char* str = "p:l:m:o:s:t:c:a:";
-    while ((opt = getopt(argc, argv, str)) != -1) {
-        switch (opt) {
-        case 'p': PORT       = atoi(optarg); break;
-        case 'l': LOGWrite   = atoi(optarg); break;
-        case 'm': TRIGMode   = atoi(optarg); break;
-        case 'o': OPT_LINGER = atoi(optarg); break;
-        case 's': sql_num    = atoi(optarg); break;
-        case 't': thread_num = atoi(optarg); break;
-        case 'c': close_log  = atoi(optarg); break;
-        case 'a': actor_model= atoi(optarg); break;
-        default:  break;
-        }
-    }
-}
-```
-
-**用法：**
-
-```bash
-./server -p 9007 -l 1 -m 3 -s 10 -t 10 -c 0 -a 0
-# 端口 9007、异步日志、ET+ET、10 连接、10 线程、开日志、Proactor
-```
-
-### Step 3：`main` 函数
-
-```cpp
-// main.cpp
-#include "config.h"
-
-int main(int argc, char* argv[]) {
-    // --- 数据库配置（按你的实际环境修改）---
-    string user         = "root";
-    string passwd       = "your_password";
-    string databasename = "qgydb";
-
-    // --- 命令行解析 ---
+int main(int argc, char *argv[]) {
+    // 1. 解析命令行参数
     Config config;
     config.parse_arg(argc, argv);
 
-    // --- 初始化服务器 ---
     WebServer server;
+
+    // 2. 初始化参数
     server.init(config.PORT, user, passwd, databasename,
-                config.LOGWrite, config.OPT_LINGER,
-                config.TRIGMode, config.sql_num,
-                config.thread_num, config.close_log,
-                config.actor_model);
+                config.LOGWrite, config.OPT_LINGER, config.TRIGMode,
+                config.sql_num, config.thread_num,
+                config.close_log, config.actor_model);
 
-    // --- 六大启动步骤 ---
-    server.log_write();     // 日志系统
-    server.sql_pool();      // 数据库连接池
-    server.thread_pool();   // 线程池
-    server.trig_mode();     // LT/ET 配置
-    server.eventListen();   // socket + epoll + 信号
-    server.eventLoop();     // 主事件循环
+    // 3. 启动日志系统（Phase 2）
+    server.log_write();
 
-    return 0;
+    // 4. 初始化数据库连接池（Phase 3）
+    server.sql_pool();
+
+    // 5. 创建线程池（Phase 4）
+    server.thread_pool();
+
+    // 6. 设置触发模式（Phase 7）
+    server.trig_mode();
+
+    // 7. 创建监听 socket + epoll（Phase 7）
+    server.eventListen();
+
+    // 8. 进入主事件循环（Phase 7）
+    server.eventLoop();
 }
 ```
 
-### Step 4：`eventListen` —— 网络编程启动
+**⚠️ 注意初始化的顺序！**
+- `log_write` 必须在最前面——后续的 `sql_pool` 和 `thread_pool` 初始化中可能会 LOG_ERROR
+- `sql_pool` 必须在 `thread_pool` 之前——线程池构造时需要传入数据库连接池指针
+- `eventListen` 必须在最后——它设置了信号处理，应该在所有初始化完成后
 
-```cpp
-void WebServer::eventListen() {
-    // 1. socket
-    m_listenfd = socket(PF_INET, SOCK_STREAM, 0);
+### Step 3：事件循环的 5 类事件
 
-    // 2. SO_LINGER
-    if (0 == m_OPT_LINGER) {
-        struct linger tmp = {0, 1};
-        setsockopt(m_listenfd, SOL_SOCKET, SO_LINGER, &tmp, sizeof(tmp));
-    } else {
-        struct linger tmp = {1, 1};
-        setsockopt(m_listenfd, SOL_SOCKET, SO_LINGER, &tmp, sizeof(tmp));
-    }
-
-    // 3. bind + listen
-    struct sockaddr_in address;
-    bzero(&address, sizeof(address));
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_ANY);
-    address.sin_port = htons(m_port);
-
-    int flag = 1;
-    setsockopt(m_listenfd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
-    bind(m_listenfd, (struct sockaddr*)&address, sizeof(address));
-    listen(m_listenfd, 5);
-
-    // 4. epoll
-    utils.init(TIMESLOT);
-    m_epollfd = epoll_create(5);
-    utils.addfd(m_epollfd, m_listenfd, false, m_LISTENTrigmode);
-    http_conn::m_epollfd = m_epollfd;
-
-    // 5. 信号管道
-    socketpair(PF_UNIX, SOCK_STREAM, 0, m_pipefd);
-    utils.setnonblocking(m_pipefd[1]);
-    utils.addfd(m_epollfd, m_pipefd[0], false, 0);
-
-    // 6. 注册信号
-    utils.addsig(SIGPIPE, SIG_IGN);
-    utils.addsig(SIGALRM, utils.sig_handler, false);
-    utils.addsig(SIGTERM, utils.sig_handler, false);
-
-    // 7. 启动定时器
-    alarm(TIMESLOT);
-
-    // 8. 设置全局静态变量
-    Utils::u_pipefd  = m_pipefd;
-    Utils::u_epollfd = m_epollfd;
-}
-```
-
-### Step 5：`eventLoop` —— 主事件循环
+`eventLoop` 用 `epoll_wait` 等待事件，然后按 fd 类型分发：
 
 ```cpp
 void WebServer::eventLoop() {
-    bool timeout = false;
-    bool stop_server = false;
-
     while (!stop_server) {
         int number = epoll_wait(m_epollfd, events, MAX_EVENT_NUMBER, -1);
-        if (number < 0 && errno != EINTR) {
-            LOG_ERROR("epoll failure");
-            break;
-        }
-
+        
         for (int i = 0; i < number; i++) {
             int sockfd = events[i].data.fd;
 
-            // --- 分支 1：新连接 ---
             if (sockfd == m_listenfd) {
-                bool flag = dealclientdata();
-                if (!flag) continue;
+                // 事件1: 新连接 → accept
+                dealclientdata();
             }
-            // --- 分支 2：连接异常 ---
             else if (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
-                util_timer* timer = users_timer[sockfd].timer;
+                // 事件2: 连接异常 → 清理定时器 + 关闭
                 deal_timer(timer, sockfd);
             }
-            // --- 分支 3：信号 ---
-            else if ((sockfd == m_pipefd[0]) && (events[i].events & EPOLLIN)) {
-                bool flag = dealwithsignal(timeout, stop_server);
-                if (!flag) LOG_ERROR("signal handling error");
+            else if (sockfd == m_pipefd[0] && (events[i].events & EPOLLIN)) {
+                // 事件3: 信号（SIGALRM/SIGTERM）→ timer_handler / 退出
+                dealwithsignal(timeout, stop_server);
             }
-            // --- 分支 4：读事件 ---
             else if (events[i].events & EPOLLIN) {
+                // 事件4: 客户端数据到达 → 读 + 处理
                 dealwithread(sockfd);
             }
-            // --- 分支 5：写事件 ---
             else if (events[i].events & EPOLLOUT) {
+                // 事件5: 可以发送响应 → 写
                 dealwithwrite(sockfd);
             }
         }
-
-        // 定时器 tick
+        
+        // 定时器心跳
         if (timeout) {
-            utils.timer_handler();
+            utils.timer_handler();  // tick() + alarm()
             timeout = false;
         }
     }
 }
 ```
 
-**事件分发的五个分支：**
+**事件优先级**（代码中的判断顺序）：
+1. 新连接优先（listenfd 有新连接必须尽快 accept，否则 backlog 满了会丢连接）
+2. 异常连接（尽快清理，释放资源）
+3. 信号处理（定时器 tick 和终止信号需要及时响应）
+4. 读事件
+5. 写事件
 
-| 条件 | 含义 | 处理函数 |
-|------|------|---------|
-| `fd == listenfd` | 新客户端连接 | `dealclientdata` |
-| `EPOLLRDHUP \| EPOLLHUP \| EPOLLERR` | 对端关闭或错误 | `deal_timer`（清理） |
-| `fd == pipefd && EPOLLIN` | 信号到达 | `dealwithsignal` |
-| `EPOLLIN` | 数据可读 | `dealwithread` |
-| `EPOLLOUT` | 可写（缓冲区空） | `dealwithwrite` |
-
-### Step 6：读写分发（Proactor vs Reactor）
+### Step 4：命令行参数解析
 
 ```cpp
-void WebServer::dealwithread(int sockfd) {
-    util_timer* timer = users_timer[sockfd].timer;
-
-    if (1 == m_actormodel) {
-        // --- Reactor：主线程只投递，工作线程自己去读 ---
-        if (timer) adjust_timer(timer);
-        m_pool->append(users + sockfd, 0);  // state=0 表示读任务
-
-        // 自旋等待工作线程处理完成
-        while (true) {
-            if (1 == users[sockfd].improv) {
-                if (1 == users[sockfd].timer_flag)
-                    deal_timer(timer, sockfd);
-                users[sockfd].improv = 0;
-                break;
-            }
-        }
-    } else {
-        // --- Proactor：主线程先读，再投递给工作线程 ---
-        if (users[sockfd].read_once()) {
-            m_pool->append_p(users + sockfd);
-            if (timer) adjust_timer(timer);
-        } else {
-            deal_timer(timer, sockfd);
+// config.cpp
+void Config::parse_arg(int argc, char* argv[]) {
+    int opt;
+    const char *str = "p:l:m:o:s:t:c:a:";
+    while ((opt = getopt(argc, argv, str)) != -1) {
+        switch (opt) {
+            case 'p': PORT = atoi(optarg); break;       // 端口
+            case 'l': LOGWrite = atoi(optarg); break;    // 日志模式
+            case 'm': TRIGMode = atoi(optarg); break;    // LT/ET 组合
+            case 'o': OPT_LINGER = atoi(optarg); break;  // 优雅关闭
+            case 's': sql_num = atoi(optarg); break;     // 数据库连接数
+            case 't': thread_num = atoi(optarg); break;  // 线程数
+            case 'c': close_log = atoi(optarg); break;   // 关闭日志
+            case 'a': actor_model = atoi(optarg); break; // Proactor/Reactor
         }
     }
 }
 ```
 
-### Step 7：数据库准备
+**⚠️ 注意 `getopt` 的冒号规则：**
+- `"p:"` — 冒号表示 `-p` 后面**必须**跟一个参数
+- `"p"` — 没有冒号表示 `-p` 是一个开关（不需要参数）
 
-```sql
--- 在 MySQL 中执行
-CREATE DATABASE qgydb;
-USE qgydb;
+### Step 5：数据库相关的安全问题
 
-CREATE TABLE user (
-    username CHAR(50) NULL,
-    passwd   CHAR(50) NULL
-) ENGINE=InnoDB;
-
--- 可选：插入一个测试用户
-INSERT INTO user(username, passwd) VALUES('admin', '123456');
-```
-
-### Step 8：静态文件准备
-
-在项目目录下放一个 `root` 文件夹，包含这些 HTML 页面（本项目自带）：
-
-```
-root/
-├── judge.html          # 首页/导航
-├── register.html       # 注册页
-├── log.html            # 登录页
-├── welcome.html        # 欢迎页
-├── registerError.html  # 注册失败
-├── logError.html       # 登录失败
-├── picture.html        # 图片展示
-├── video.html          # 视频展示
-├── fans.html           # 粉丝页
-├── favicon.ico
-└── *.jpg, *.gif, *.mp4
-```
-
-### Step 9：最终 cmake 整合
-
-```cmake
-cmake_minimum_required(VERSION 3.10)
-project(TinyWebServer VERSION 1.0.0 LANGUAGES CXX)
-
-set(CMAKE_CXX_STANDARD 11)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# 整个项目的头文件都能找到彼此
-include_directories(${CMAKE_SOURCE_DIR})
-
-# 查找 MySQL 客户端库
-find_library(MYSQL_LIB mysqlclient
-    PATHS /usr/lib/x86_64-linux-gnu
-          /usr/lib64/mysql
-          /usr/local/mysql/lib)
-
-add_executable(server
-    main.cpp
-    config.cpp
-    webserver.cpp
-    http/http_conn.cpp
-    log/log.cpp
-    timer/lst_timer.cpp
-    CGImysql/sql_connection_pool.cpp
-)
-
-target_link_libraries(server
-    pthread
-    ${MYSQL_LIB}
-)
-```
-
-### Step 10：编译运行
-
-```bash
-# 创建数据库和表（见 Step 7）
-# 修改 main.cpp 中的数据库密码
-
-cmake -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build
-
-# 启动（使用默认参数）
-./build/server
-
-# 或自定义参数
-./build/server -p 9007 -l 1 -m 3 -s 10 -t 10
-```
-
-浏览器打开 `http://<你的IP>:9006`，应该看到导航页。
-
----
-
-## 完整请求流程追溯
-
-以一次"注册"请求为例，完整跟踪代码路径：
-
-```
-1. 浏览器 → TCP SYN → listenfd
-2. epoll_wait 返回 → 进入 dealclientdata
-3. accept → connfd → timer(connfd): 创建定时器
-4. addfd: connfd 注册到 epoll (EPOLLIN | EPOLLET | EPOLLONESHOT)
-
-5. 浏览器 → POST /3CGI HTTP/1.1 + body
-6. epoll_wait 返回 connfd EPOLLIN → dealwithread
-7. read_once(): 循环 recv 读完整请求
-8. Proactor: append_p(users+connfd) → 投递到线程池
-9. 工作线程: read_once() → process()
-10. process_read(): 状态机 → CHECK_STATE_CONTENT → parse_content → GET_REQUEST
-11. do_request(): 解析 name/password → INSERT INTO user → m_url="/log.html"
-12. process_write(): 构造 200 OK + log.html 内容
-13. modfd(EPOLLOUT) → 下次 epoll_wait 返回 EPOLLOUT
-14. dealwithwrite → write(): writev 发送响应头 + 文件 → unmap
-15. keep-alive: modfd(EPOLLIN) → 等待下一个请求
-```
-
----
-
-## 验证方法
-
-- [ ] `./build/server` 正常启动，无报错
-- [ ] 浏览器访问 `http://ip:9006/` → 显示导航页
-- [ ] 点击注册 → 输入用户名密码 → 注册成功跳转登录页
-- [ ] 登录 → 输入密码 → 登录成功显示欢迎页
-- [ ] 点击图片页 → 正确显示图片
-- [ ] 用不同的 `-m` 参数测试 LT/ET 组合
-- [ ] 用不同的 `-a` 参数测试 Reactor/Proactor
-
----
-
-## 安全注意事项（进阶阅读）
-
-本项目的定位是教学演示，以下是生产环境部署前必须关注的安全问题：
-
-### SQL 注入
-
-`do_request` 中直接将用户输入拼接到 SQL 语句：
+**⚠️ SQL 注入风险：** 本项目为了保持教学简洁，直接在 `do_request()` 中拼接 SQL 字符串：
 
 ```cpp
-char sql_insert[200];
-sprintf(sql_insert, "INSERT INTO user(username, passwd) VALUES('%s', '%s')", name, password);
+// ⚠️ 教学代码，不安全！生产环境不能这样写
+char *sql_insert = (char *)malloc(sizeof(char) * 200);
+strcpy(sql_insert, "INSERT INTO user(username, passwd) VALUES(");
+strcat(sql_insert, "'");
+strcat(sql_insert, name);  // 直接拼接用户输入！
+strcat(sql_insert, "', '");
+strcat(sql_insert, password);
+strcat(sql_insert, "')");
 mysql_query(mysql, sql_insert);
 ```
 
-如果用户输入 `admin' OR '1'='1`，SQL 语义就被篡改了。**防护：** 使用 `mysql_real_escape_string` 转义特殊字符，或使用 MySQL 预处理语句（Prepared Statement）。
-
-### 路径穿越
-
-URL 中的 `..` 可能让攻击者访问服务器上任意文件：
-
-```
-GET /../../../etc/passwd HTTP/1.1
-```
-
-**防护：** 在 `do_request` 中拒绝包含 `..` 的 URL，或用 `realpath()` 规范化后检查前缀是否为 `doc_root`。
-
-### 缓冲区溢出
-
-多处使用 `strcpy`、`sprintf` 没有边界检查。**防护：** 全部替换为 `strncpy`、`snprintf` 并检查返回值。
-
-### 其他常见问题
-
-- **无 HTTPS：** 密码在网络上明文传输。生产环境应使用 TLS/SSL。
-- **无速率限制：** 攻击者可暴力破解登录。应增加 IP 级别的失败计数和限流。
-- **无输入长度限制：** 用户名/密码无最大长度限制，可导致服务资源耗尽。
+**正确的做法（生产环境）：**
+1. 使用**参数化查询（Prepared Statement）**：`mysql_stmt_prepare` + `mysql_stmt_bind_param`
+2. 对密码进行**哈希（hash）**，不要存明文：`SHA256(password + salt)`
+3. 输入验证：用户名长度限制、不允许特殊字符
 
 ---
 
-## 踩坑记录
+## 验证用例与预期结果
 
-1. **`getcwd` 获取工作目录。** `m_root` 是 `getcwd() + "/root"`，确保你从项目根目录启动服务器（`./build/server`，不是 `cd build && ./server`）。
+### 测试 1：编译
 
-2. **MySQL 连接失败。** 检查：MySQL 是否运行、用户名密码是否正确、数据库 `qgydb` 是否存在、表 `user` 是否存在。
+```bash
+cd guide/phase_8/src
+mkdir -p build && cd build
+cmake ..
+make
+```
 
-3. **端口被占用。** `Address already in use` → 等 60 秒（TIME_WAIT）或设置 `SO_REUSEADDR`。
+### 测试 2：启动服务器
 
-4. **`server_path` 数组太小。** 路径太长会截断，确保 `char server_path[200]` 足够容纳完整路径。
+```bash
+./server -p 9006 -l 0 -m 0 -s 4 -t 4 -c 0 -a 0
+```
 
-5. **Proactor 模式下的 `improv` 自旋。** `dealwithread` 中的 `while (users[sockfd].improv != 1)` 是忙等（busy-wait），会浪费 CPU。这是简化实现，生产环境应该用条件变量或回调替代：
+**预期输出：**
+- 无错误信息
+- 日志文件 `ServerLog` 被创建
 
-   **方案一（条件变量）：** 主线程在 `improv` 上 `cond.wait()`，工作线程处理完后 `cond.signal()`。
+### 测试 3：浏览器访问静态页面
 
-   **方案二（回调+事件驱动）：** 工作线程处理完后通过 `eventfd` 通知主线程，主线程在 epoll 中监听 eventfd，无需自旋。
+```
+打开浏览器 → http://服务器IP:9006/
+```
 
-   ```cpp
-   // 方案一的伪代码示例
-   // 主线程 dealwithread 中：
-   m_mutex.lock();
-   if (users[sockfd].improv != 1)
-       m_cond.wait(m_mutex.get());  // 休眠，不占 CPU
-   m_mutex.unlock();
+**预期：** 显示判断页面（judge.html），包含两个链接：注册和登录。
 
-   // 工作线程 run() 中处理完后：
-   request->improv = 1;
-   m_cond.signal();  // 唤醒主线程
-   ```
+### 测试 4：注册
+
+1. 点击"注册"链接 → 进入 register.html
+2. 输入用户名和密码 → 提交
+3. **预期：** 跳转到登录页面（log.html）
+
+```bash
+# 验证数据库中有新记录
+mysql -u root -p -e "SELECT * FROM yourdb.user;"
+```
+
+### 测试 5：登录
+
+1. 在登录页面输入刚注册的用户名和密码
+2. **预期：** 跳转到欢迎页面（welcome.html）
+
+### 测试 6：登录失败
+
+1. 输入不存在的用户名或错误密码
+2. **预期：** 显示错误页面（logError.html）
+
+### 测试 7：curl 验证
+
+```bash
+# GET 请求
+curl -v http://127.0.0.1:9006/
+
+# 预期响应头包含：
+# HTTP/1.1 200 OK
+# Content-Type: text/html
+# Connection: close
+
+# POST 登录请求（模拟表单）
+curl -v -X POST -d "user=test&passwd=123" http://127.0.0.1:9006/2CGISQL.cgi
+```
+
+### 测试 8：定时器验证
+
+```bash
+# 启动服务器
+./server -p 9006
+
+# 用 telnet 连接但不发送数据
+telnet 127.0.0.1 9006
+
+# 等待 15 秒（3 × TIMESLOT = 3 × 5 = 15 秒）
+# 预期：telnet 连接自动断开
+# 日志中出现 "close fd N"
+```
+
+### 测试 9：不同模式对比
+
+```bash
+# Proactor + LT+LT
+./server -p 9006 -a 0 -m 0
+
+# Proactor + ET+ET
+./server -p 9007 -a 0 -m 3
+
+# Reactor + LT+ET
+./server -p 9008 -a 1 -m 1
+```
+
+### 失败排查
+
+| 症状 | 可能原因 |
+|------|---------|
+| 启动时报 "Address already in use" | 上次运行的进程还在占用端口。`lsof -i :9006` 找到并 `kill` |
+| 浏览器连接拒绝 | 防火墙。`sudo ufw allow 9006` |
+| 注册后数据库没记录 | MySQL 服务没启动：`sudo systemctl start mysql` |
+| 注册/登录后 500 错误 | 数据库表不存在。先用 README.md 中的 SQL 建表 |
+| 图片/视频不显示 | root 目录路径错误。确保 `m_root` 路径正确指向 `root/` |
+| 偶尔连接失败 | 文件描述符数达到上限。`ulimit -n 65536` |
+
+---
+
+## C++ 语法速查（本阶段涉及）
+
+| 语法 | 示例 | 说明 |
+|------|------|------|
+| `new[]` / `delete[]` | `users = new http_conn[MAX_FD]` | 动态分配数组 |
+| `getopt` | `getopt(argc, argv, "p:l:")` | POSIX 命令行解析（来自 C） |
+| `atoi` | `atoi(optarg)` | ASCII → 整数（C 函数） |
+| `static` 成员变量 | `static int m_user_count` | 类级别共享（所有实例同一份） |
+| `friend` class | `friend class Utils` 在 http_conn 中 | 友元声明：允许其他类访问私有成员 |
 
 ---
 
 ## 阶段小结
 
-你完成了一个功能完整的 C++ Web 服务器！它包含：
-- HTTP 解析（状态机）
-- 静态文件服务（mmap + writev）
-- 用户注册/登录（MySQL + 连接池）
-- 多种并发模型（Reactor / Proactor）
-- 多种触发模式（LT / ET 组合）
-- 定时器清理死连接
-- 同步/异步日志
+你完成了整个项目的集成！最终的 Web 服务器包含：
 
-最后一阶段：**性能压测与工程实践**——用 WebBench 压测，对比各种模式的 QPS，分析瓶颈。
+- ✅ TCP 监听 + epoll 事件驱动（Phase 7）
+- ✅ HTTP 请求解析 + 响应生成（Phase 6）
+- ✅ 线程池并发处理（Phase 4）
+- ✅ MySQL 连接池 + 注册/登录（Phase 3）
+- ✅ 定时器清理超时连接（Phase 5）
+- ✅ 同步/异步日志（Phase 2）
+- ✅ Proactor / Reactor 双模式（Phase 4 + Phase 7）
+- ✅ 命令行参数配置
+
+**后续工作：** Phase 9 — 性能压测与工程实践。
+
+---
+
+## 🔒 安全注意事项
+
+本项目的教学代码存在以下安全隐患（**不要直接用于生产环境**）：
+
+1. **SQL 注入**：直接拼接用户输入到 SQL 语句（见 Step 5）
+2. **密码明文存储**：`INSERT INTO user VALUES('name', 'passwd')` 直接存明文
+3. **路径穿越**：`do_request()` 中直接将 URL 拼接到文件路径。攻击者可以用 `/../../../etc/passwd` 尝试读取系统文件
+4. **内存泄露**：`do_request()` 中多处 `malloc`，异常路径可能泄露
+5. **缓冲区溢出**：`strcpy`/`strcat` 的使用有潜在的溢出风险

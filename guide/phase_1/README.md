@@ -1,301 +1,286 @@
-﻿# Phase 1 —— 线程同步原语
+# Phase 1 —— 线程同步原语
 
-## 目标
+## 本阶段目标
 
 用 C++ 类封装 pthread 的三种同步原语，实现一个**生产者-消费者**测试程序。
 
-**可见结果：** 多个生产者线程生产数据 → 多个消费者线程消费数据，全程无竞态、无死锁，最终所有数据恰好被消费完一次。
+**可见结果：**
+
+```
+=== Producer-Consumer Test ===
+Producers: 2, each produces 50 items
+Consumers: 3
+Buffer size: 100
+
+[Producer 1] produced item 1000 (buffer: 1/100)
+[Consumer 1] consumed item 1000 (buffer: 0/100)
+...
+[Consumer 2] exiting (all produced items consumed)
+
+=== Results ===
+Total produced:  100
+Total consumed:  100
+Buffer remaining: 0
+✅ PASS: All items consumed exactly once!
+```
+
+**验收标准：**
+
+- [ ] 程序多次运行，每次都输出 `✅ PASS`
+- [ ] 用 `ThreadSanitizer` 检查无数据竞争（`g++ -fsanitize=thread`）
+- [ ] 理解为什么 `while` 而不是 `if` 检查条件
 
 ---
 
-## 前置知识
+## 理论与机制
 
-- C++ 类的基本写法（构造函数、析构函数、成员函数）
-- 知道多线程的大概概念（多个函数同时跑）
+### 1. 为什么需要线程同步？
 
----
+当多个线程访问同一块内存时，如果至少有一个线程在写，就会出现**数据竞争（Data Race）**。
 
-## 工具聚焦
-
-| 工具 | 本次学什么 |
-|------|-----------|
-| **cmake** | `include_directories`、多文件编译、`.h` 和 `.cpp` 分离 |
-| **gdb** | `thread apply all bt`（查看所有线程栈）、`thread N`（切换线程） |
-
----
-
-## 分步实现
-
-### Step 1：理解 pthread 的三种原语
-
-Linux 下多线程同步有三个核心工具，都在 `<pthread.h>` 里：
-
-**互斥锁（mutex）**——保证同一时刻只有一个线程访问临界区：
-
-```c
-pthread_mutex_t mutex;
-pthread_mutex_init(&mutex, NULL);   // 初始化
-pthread_mutex_lock(&mutex);         // 加锁
-// ... 临界区 ...
-pthread_mutex_unlock(&mutex);       // 解锁
-pthread_mutex_destroy(&mutex);      // 销毁
-```
-
-**信号量（semaphore）**——控制同时访问资源的线程数量：
-
-```c
-sem_t sem;
-sem_init(&sem, 0, 5);   // 初始值 5，表示允许 5 个线程同时访问
-sem_wait(&sem);         // P 操作：值减 1，如果值为 0 则阻塞
-sem_post(&sem);         // V 操作：值加 1，唤醒等待的线程
-sem_destroy(&sem);
-```
-
-**条件变量（condition variable）**——让线程等待"某个条件成立"：
-
-```c
-pthread_cond_t cond;
-pthread_cond_init(&cond, NULL);
-pthread_cond_wait(&cond, &mutex);        // 释放 mutex 并等待条件
-pthread_cond_signal(&cond);              // 唤醒一个等待线程
-pthread_cond_broadcast(&cond);           // 唤醒所有等待线程
-pthread_cond_destroy(&cond);
-```
-
-### Step 2：封装成 C++ 类
-
-C 风格 API 的问题是：忘记 `destroy` 就会泄漏资源。C++ 的解决方案是**RAII**——资源在构造时获取，在析构时自动释放。
+**一个经典的数据竞争例子：**
 
 ```cpp
-// locker.h
-#ifndef LOCKER_H
-#define LOCKER_H
+// 线程 A 和 线程 B 同时执行 counter++
+// 这一个操作在 CPU 层面是三条指令：
+//   1. LOAD  counter → register   (从内存读取)
+//   2. ADD   register, 1           (在寄存器中加 1)
+//   3. STORE register → counter   (写回内存)
 
-#include <pthread.h>
-#include <semaphore.h>
-#include <exception>
+// 可能的交错执行顺序（导致结果错误）：
+//   A: LOAD counter(0)     B: LOAD counter(0)    ← 都读到 0
+//   A: ADD  → 1            B: ADD  → 1
+//   A: STORE counter=1     B: STORE counter=1    ← counter 应该是 2，实际是 1！
+```
 
-// ---- 信号量 ----
+**三种同步原语各解决不同的问题：**
+
+| 原语 | 解决的问题 | 现实类比 |
+|------|-----------|---------|
+| **互斥锁（mutex）** | 互斥访问：同一时刻只有一个线程进入临界区 | 厕所的门锁——一次一个人 |
+| **信号量（semaphore）** | 控制资源数量：最多 N 个线程同时访问 | 停车场——只有 N 个车位 |
+| **条件变量（cond）** | 等待条件：线程 A 干完活了通知线程 B | 餐厅叫号器——"第 42 号，您的菜好了" |
+
+### 2. 条件变量的底层原理
+
+条件变量最难理解，但它本质上是把三个操作打包成了**一个原子操作**：
+
+```
+"释放锁 + 睡觉 + (被叫醒后)重新拿锁"
+```
+
+**为什么必须是原子的？** 如果释放锁和睡觉不是原子的：
+
+```
+线程 A（消费者）:
+  释放锁
+     ← 线程 B（生产者）在这里拿到锁，broadcast，但线程 A 还没睡！
+       线程 B 的 broadcast 发送到了一个还没开始等待的线程 → 丢失唤醒！
+  睡觉
+  → 线程 A 永远睡下去，没人来叫醒它 → 死锁
+```
+
+这就是为什么 `pthread_cond_wait` 需要传入**已经锁住的 mutex**——它内部会原子地完成释放+等待。
+
+### 3. RAII 的哲学（Resource Acquisition Is Initialization）
+
+本项目用类封装 pthread API 的核心思想是 RAII：
+
+- **构造函数** = 获取资源（`sem_init` / `pthread_mutex_init`）
+- **析构函数** = 释放资源（`sem_destroy` / `pthread_mutex_destroy`）
+- **好处**：你永远不会忘记释放资源——C++ 编译器保证对象离开作用域时自动调用析构函数
+
+---
+
+## 实现指南
+
+### Step 1：封装信号量（sem）
+
+完整代码见 `src/locker.h`。
+
+**核心数据结构：**
+
+```cpp
 class sem {
 public:
-    sem() {
-        if (sem_init(&m_sem, 0, 0) != 0)
-            throw std::exception();
-    }
-    explicit sem(int num) {
-        if (sem_init(&m_sem, 0, num) != 0)
-            throw std::exception();
-    }
-    ~sem() { sem_destroy(&m_sem); }
-
-    bool wait() { return sem_wait(&m_sem) == 0; }
-    bool post() { return sem_post(&m_sem) == 0; }
-
+    sem();           // 默认构造：初值 0（用于事件通知）
+    sem(int num);    // 带参构造：初值 num（用于资源池）
+    ~sem();          // 析构：销毁信号量
+    bool wait();     // P 操作：等待（值减 1，值 < 0 时阻塞）
+    bool post();     // V 操作：释放（值加 1，唤醒等待者）
 private:
-    sem_t m_sem;
+    sem_t m_sem;     // POSIX 信号量
 };
+```
 
-// ---- 互斥锁 ----
+**⚠️ 注意：**
+- `sem_init` 的第二个参数为 0 表示不在进程间共享（本项目的线程都在同一进程内）
+- 信号量与互斥锁的区别：信号量的 `post` 可以不在同一个线程中调用，但互斥锁的 `unlock` 必须在同一个线程
+
+### Step 2：封装互斥锁（locker）
+
+```cpp
 class locker {
 public:
-    locker() {
-        if (pthread_mutex_init(&m_mutex, NULL) != 0)
-            throw std::exception();
-    }
-    ~locker() { pthread_mutex_destroy(&m_mutex); }
-
-    bool lock()   { return pthread_mutex_lock(&m_mutex) == 0; }
-    bool unlock() { return pthread_mutex_unlock(&m_mutex) == 0; }
-    pthread_mutex_t* get() { return &m_mutex; }
-
+    locker();
+    ~locker();
+    bool lock();
+    bool unlock();
+    pthread_mutex_t* get();  // ⚠️ 暴露原始指针供条件变量使用
 private:
     pthread_mutex_t m_mutex;
 };
+```
 
-// ---- 条件变量 ----
+**⚠️ `get()` 方法的设计取舍：**
+条件变量的 `wait` 需要 `pthread_mutex_t*`。这里选择暴露内部指针而不是让 `cond` 持有 `locker` 引用——这是为了保持类的简洁和低耦合。代价是破坏了封装性，使用者需要遵守"拿到指针后只在 cond 中使用"的约定。
+
+### Step 3：封装条件变量（cond）
+
+```cpp
 class cond {
 public:
-    cond() {
-        if (pthread_cond_init(&m_cond, NULL) != 0)
-            throw std::exception();
-    }
-    ~cond() { pthread_cond_destroy(&m_cond); }
-
-    bool wait(pthread_mutex_t* m) {
-        return pthread_cond_wait(&m_cond, m) == 0;
-    }
-    bool signal()    { return pthread_cond_signal(&m_cond) == 0; }
-    bool broadcast() { return pthread_cond_broadcast(&m_cond) == 0; }
-
+    cond();
+    ~cond();
+    bool wait(pthread_mutex_t* m_mutex);          // 无限等待
+    bool timewait(pthread_mutex_t* m_mutex, struct timespec t); // 带超时
+    bool signal();      // 唤醒一个
+    bool broadcast();   // 唤醒全部
 private:
     pthread_cond_t m_cond;
 };
-
-#endif
 ```
 
-**设计要点：**
-- 构造函数里 `init`，析构函数里 `destroy`——绝不可能忘。
-- 构造函数里如果 `init` 失败就抛异常——不让"半成品"对象存在。
-- 每个类的接口极简：只暴露使用方真正需要的操作。
+### Step 4：生产者-消费者模型验证
 
-### Step 3：多文件项目 + cmake
-
-完整的 CMakeLists.txt：
-
-```cmake
-cmake_minimum_required(VERSION 3.10)
-project(LockDemo VERSION 0.1.0 LANGUAGES CXX)
-
-set(CMAKE_CXX_STANDARD 11)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
-
-include_directories(${CMAKE_SOURCE_DIR})
-
-add_executable(producer_consumer
-    test_producer_consumer.cpp
-)
-target_link_libraries(producer_consumer pthread)
-```
-
-> **注意 `target_link_libraries(... pthread)`：** pthread 是 Linux 的线程库，必须显式链接。如果不加，编译不会报错但运行时会崩溃或行为异常。
-
-### Step 4：生产者-消费者测试
+完整代码见 `src/test_producer_consumer.cpp`。核心模式：
 
 ```cpp
-// test_producer_consumer.cpp
-#include <iostream>
-#include <queue>
-#include <pthread.h>
-#include <unistd.h>
-#include "locker.h"
-
-// 共享资源
-std::queue<int> q;       // 任务队列
-locker mtx;              // 保护队列的互斥锁
-sem slots(10);           // 队列空位数（初始 10）
-sem items(0);            // 队列中数据数（初始 0）
-
-bool done = false;       // 生产结束标志
-
-void* producer(void* arg) {
-    int id = *(int*)arg;
-    for (int i = 0; i < 5; ++i) {
-        sleep(1);                               // 模拟生产耗时
-        slots.wait();                           // 等待空位
-        mtx.lock();
-        q.push(i);
-        std::cout << "Producer " << id
-                  << " produced " << i << std::endl;
-        mtx.unlock();
-        items.post();                           // 通知有新数据
-    }
-    return NULL;
+// === 生产者 ===
+m_mutex.lock();
+while (buffer_full) {              // ⚠️ while 不是 if！
+    m_cond.wait(m_mutex.get());    // 释放锁 + 阻塞 + 被唤醒后重拿锁
 }
+produce();
+m_cond.broadcast();                // 通知消费者
+m_mutex.unlock();
 
-void* consumer(void* arg) {
-    int id = *(int*)arg;
-    while (true) {
-        items.wait();                           // 等待数据
-        mtx.lock();
-        if (q.empty() && done) {
-            mtx.unlock();
-            items.post();   // 通知其他消费者也退出
-            break;
-        }
-        int val = q.front();
-        q.pop();
-        std::cout << "Consumer " << id
-                  << " consumed " << val << std::endl;
-        mtx.unlock();
-        slots.post();                           // 释放空位
-        sleep(2);                               // 模拟消费耗时
-    }
-    return NULL;
+// === 消费者 ===
+m_mutex.lock();
+while (buffer_empty) {
+    // 检查终止条件（所有生产者都结束了）
+    if (all_done) { m_mutex.unlock(); return; }
+    m_cond.wait(m_mutex.get());
 }
-
-int main() {
-    pthread_t producers[2], consumers[3];
-    int ids[] = {1, 2, 3};
-
-    // 创建 2 个生产者
-    for (int i = 0; i < 2; ++i)
-        pthread_create(&producers[i], NULL, producer, &ids[i]);
-
-    // 创建 3 个消费者
-    for (int i = 0; i < 3; ++i)
-        pthread_create(&consumers[i], NULL, consumer, &ids[i]);
-
-    // 等待生产者完成
-    for (int i = 0; i < 2; ++i)
-        pthread_join(producers[i], NULL);
-
-    // 标记生产结束
-    mtx.lock();
-    done = true;
-    mtx.unlock();
-    items.post();   // 唤醒可能阻塞的消费者
-
-    // 等待消费者完成
-    for (int i = 0; i < 3; ++i)
-        pthread_join(consumers[i], NULL);
-
-    std::cout << "All done!" << std::endl;
-    return 0;
-}
+consume();
+m_cond.broadcast();                // 通知生产者有空位了
+m_mutex.unlock();
 ```
 
-编译运行：
+**⚠️ 为什么必须用 `while` 而不是 `if`？**
 
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build
-./build/producer_consumer
-```
-
-你应该看到生产者和消费者的打印交替出现，最终 "All done!" 且所有数据恰好被消费一次。
+两个原因：
+1. **虚假唤醒（Spurious Wakeup）**：POSIX 允许 `pthread_cond_wait` 在没有 `signal`/`broadcast` 的情况下返回（极少见，但标准允许）
+2. **多个消费者竞争**：消费者 A 被唤醒后，消费者 B 也醒了并且抢先消费了最后一个数据。消费者 A 拿到锁后，发现队列又空了
 
 ### Step 5：gdb 多线程调试
 
 ```bash
-gdb ./build/producer_consumer
+gdb ./build/test_sync
 
-# 在 gdb 内：
-(gdb) break producer           # 在 producer 函数设断点
-(gdb) break consumer           # 在 consumer 函数设断点
-(gdb) run
-# 程序会在某个线程停在断点
+# 查看所有线程
+(gdb) info threads
+  Id   Target Id         Frame
+* 1    Thread ...         main ()
+  2    Thread ...         producer ()
+  3    Thread ...         consumer ()
 
-(gdb) info threads             # 查看所有线程
-(gdb) thread 2                 # 切换到线程 2
-(gdb) thread apply all bt      # 查看所有线程的调用栈
+# 切换到线程 2
+(gdb) thread 2
+
+# 查看所有线程的调用栈
+(gdb) thread apply all bt
+
+# 在所有线程的 locker::lock 设断点
+(gdb) break locker::lock
+(gdb) thread apply all break locker::lock
 ```
 
 ---
 
-## 验证方法
+## 验证用例与预期结果
 
-- [ ] 程序每次运行都能正常结束（无死锁、无崩溃）
-- [ ] 生产者生产的每个数据恰好被一个消费者消费（检查输出计数）
-- [ ] `valgrind --tool=helgrind ./build/producer_consumer` 无竞态报告
-- [ ] gdb 中能用 `thread apply all bt` 看到所有线程栈
+### 测试 1：编译运行
+
+```bash
+cd guide/phase_1/src
+mkdir -p build && cd build
+cmake ..
+make
+./test_sync
+```
+
+**预期：** 输出结束显示 `✅ PASS: All items consumed exactly once!`
+
+### 测试 2：用 ThreadSanitizer 检查数据竞争
+
+```bash
+cd guide/phase_1/src
+g++ -g -fsanitize=thread -pthread -o test_sync_tsan test_producer_consumer.cpp
+./test_sync_tsan
+```
+
+**预期：** 无任何 "data race" 警告。如果出现，说明 lock 的封装有问题。
+
+### 测试 3：多次运行验证确定性
+
+```bash
+for i in $(seq 1 10); do
+    ./build/test_sync
+    if [ $? -ne 0 ]; then
+        echo "FAILED on run $i"
+        break
+    fi
+done
+echo "All 10 runs passed ✅"
+```
+
+### 失败排查
+
+| 症状 | 可能原因 | 检查方法 |
+|------|---------|---------|
+| 程序永远不结束 | 死锁 | gdb attach，`thread apply all bt` 看每个线程卡在哪里 |
+| `❌ FAIL` | 消费者提前退出或 count 计算错误 | 打印中间状态 |
+| ThreadSanitizer 报 data race | 某处访问共享变量没加锁 | 看 TSan 报告的具体行号 |
+| 输出顺序混乱 | 正常！多线程输出不保证顺序 | 每个线程的 produce/consume 逻辑应该是对的 |
 
 ---
 
-## 踩坑记录
+## C++ 语法速查（本阶段涉及）
 
-1. **忘记链接 `-lpthread`。** 症状：编译通过但运行时崩溃。在 cmake 里一定要 `target_link_libraries(xxx pthread)`。
+| 语法 | 示例 | 说明 |
+|------|------|------|
+| `class` | `class sem { ... };` | C++ 类定义（默认访问是 private） |
+| `public:` / `private:` | `public: sem();` | 访问控制标签 |
+| 构造函数 | `sem() { ... }` | 对象创建时自动调用 |
+| 析构函数 | `~sem() { ... }` | 对象销毁时自动调用 |
+| 成员初始化列表 | `sem() : val(0) { }` | 构造函数冒号后初始化成员（更高效） |
+| `throw` | `throw std::exception()` | 抛出异常 |
+| `void*` | `void* arg` | 通用指针（C 风格） |
+| `static_cast<T*>` | `static_cast<int*>(arg)` | 安全的类型转换 |
 
-2. **条件变量虚假唤醒。** `pthread_cond_wait` 返回后，你等待的条件不一定为真（OS 可能虚假唤醒）。所以必须在 while 循环中检查条件，而不是 if。
-
-3. **信号量和条件变量的区别。** 信号量存"状态"（值），条件变量不存。信号量 `post` 时即使没人 wait，值也会 +1；下次 `wait` 直接通过。条件变量 `signal` 时如果没人 `wait`，信号就丢了。
-
-4. **析构顺序。** 确保所有线程 `pthread_join` 结束之后再销毁锁和信号量，否则线程可能在已销毁的对象上操作。
 ---
 
 ## 阶段小结
 
-你封装了三个同步原语（mutex、semaphore、cond），并用 `locker.h` 驱动了一个生产者-消费者程序。这份 `locker.h` 将在后续几乎所有模块中被引用——它是整个项目的"地基"。
+你实现了：
 
-下一阶段：**阻塞队列与日志系统**——在 `locker.h` 之上构建线程安全的阻塞队列，再基于阻塞队列实现异步日志。
+- ✅ `sem` — POSIX 信号量的 C++ 封装
+- ✅ `locker` — POSIX 互斥锁的 C++ 封装
+- ✅ `cond` — POSIX 条件变量的 C++ 封装
+- ✅ 生产者-消费者模型验证（2 生产者 + 3 消费者，无竞态）
+- ✅ gdb 多线程调试基础（`info threads`、`thread apply all bt`）
+
+**`locker.h` 将在后续每个阶段中使用。** 它是整个项目并发安全的地基。
+
+下一阶段：**Phase 2 — 阻塞队列与日志系统**，基于本阶段的同步原语，构建线程安全的阻塞队列和单例日志系统。
