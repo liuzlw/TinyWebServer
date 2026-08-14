@@ -9,7 +9,7 @@
 - [ ] 理解单例模式(`Log::get_instance()`)
 - [ ] 服务器关键事件写入日志文件,`tail -f` 实时观察
 
-**最终效果:** 服务器运行后,当前目录生成 `2026_08_01_ServerLog` 日志文件,每次 accept/请求/关闭都记录带时间戳的日志。
+**最终效果:** 服务器运行后,当前目录生成 `{当天日期}_ServerLog` 日志文件(如 `2026_08_03_ServerLog`),每次 accept/请求/关闭都记录带时间戳的日志。
 
 ## 2. 前置知识
 
@@ -31,7 +31,7 @@
 
 `block_queue<T>` 就是这个队列——**循环数组 + 互斥锁 + 条件变量**,和 C5 的生产者消费者一模一样。
 
-在 `my_tiny_webserver/log/` 下新建 `block_queue.h`(**与原项目一致**,模板类):
+在 `my_tiny_webserver/log/` 下新建 `block_queue.h`(**简化版**:只留本阶段用到的 `push/pop` 等方法,去掉了 `front()/back()/max_size()` 和带超时的 `pop(T&, int ms_timeout)`;模板类,原版 S9 再换):
 
 ```cpp
 /*************************************************************
@@ -180,11 +180,11 @@ private:
 | `m_cond` | `pop` 时队列空就 `wait` 睡觉;`push` 后 `broadcast` 唤醒 |
 | `while (m_size <= 0)` | 用 while 不用 if——防止**假唤醒**(被唤醒但又被别的线程抢了) |
 
-> 这里的 `cond::wait(m_mutex.get())` 需要 `locker.h` 里的 `get()` 返回原生 `pthread_mutex_t *`。S3 的简化版 locker.h 没带 `timewait`,所以本阶段**把 locker.h 换成原版**(多了 `timewait` 方法,其他一致)。
+> 这里的 `cond::wait(m_mutex.get())` 用到 `locker.h` 的 `get()`(返回原生 `pthread_mutex_t *`),这个接口 S3 简化版就有——所以**当前这个简化版 block_queue 不换 locker.h 也能编译**。那为什么还要换原版?因为原版 `block_queue` 的 `pop(T&, int ms_timeout)` 会用到 `cond::timewait`(带超时的条件等待),S9 换原版时一定需要;现在提前换掉,免得以后再动。
 
 ## 5. log.h + log.cpp:单例 + 同步/异步切换
 
-在 `my_tiny_webserver/log/` 下新建 `log.h`(**与原项目一致**):
+在 `my_tiny_webserver/log/` 下新建 `log.h`(**代码与原项目一致,注释按教学需要改写**):
 
 ```cpp
 #ifndef LOG_H
@@ -264,7 +264,7 @@ private:
 
 **LOG 宏的秘密:** 注意 `LOG_INFO(...)` 展开后是 `if(0 == m_close_log) {...}`——里面引用了 **`m_close_log`**。在类成员函数里(如 http_conn),它解析为类的成员变量;在 main 里,需要一个全局变量 `int m_close_log = 0;` 供它解析。这就是"用宏的代价":宏不知道作用域。
 
-在 `my_tiny_webserver/log/` 下新建 `log.cpp`(**与原项目一致**):
+在 `my_tiny_webserver/log/` 下新建 `log.cpp`(**代码与原项目一致,注释按教学需要改写**):
 
 ```cpp
 #include <string.h>
@@ -585,7 +585,14 @@ int main()
                 if (users[sockfd].read_once())
                 {
                     adjust_timer(sockfd);
+                    int before = http_conn::m_user_count;
                     users[sockfd].process();
+                    // process() 内部可能已经关闭了连接(比如请求的文件不存在,
+                    // process_write 返回 false → 直接 close_conn)。这时定时器还留在链表里:
+                    // 若 fd 被新连接复用,残留定时器 15 秒后 tick() 会误关新连接。
+                    // 所以连接数减少了就说明刚被 process() 关掉,立即删掉它的定时器(Stage 6 讲过)。
+                    if (http_conn::m_user_count < before)
+                        timer_lst.del_timer(users_timer[sockfd].timer);
                     LOG_INFO("处理连接 %d 的请求", sockfd);
                 }
                 else
@@ -615,7 +622,9 @@ int main()
 }
 ```
 
-**注意**:S7 的 `lock/locker.h` 要换成**原版**(多了 `cond::timewait`,block_queue 需要)。命令:
+> ⚠️ **S6 的"删除残留定时器"逻辑要一直保留**:上面 EPOLLIN 分支在 `process()` 之后做了连接数对比——`process()` 内部可能自己关连接(比如请求的文件不存在,`process_write` 返回 false → 直接 `close_conn`),此时若不删掉它的定时器,fd 被新连接复用后,残留定时器会在超时后误关新连接。S6 专门讲过这个坑,本阶段(以及 S8)的代码都保留着它,别在抄写时漏掉。
+
+**注意**:建议把 `lock/locker.h` 换成**原版**(多了 `cond::timewait`)。当前简化版 block_queue 其实用不到它,但原版 block_queue 的 `pop(T&, int ms_timeout)` 需要——S9 换原版时必然要用,现在换掉省得以后再换。命令:
 
 ```bash
 cp ../lock/locker.h lock/locker.h
@@ -646,7 +655,7 @@ cmake --build build
 **另开一个终端,实时看日志:**
 
 ```bash
-tail -f 2026_08_01_ServerLog
+tail -f *ServerLog        # 文件名带当天日期,用通配符就不用记具体日期
 ```
 
 再发几个请求(`curl http://127.0.0.1:9006/welcome.html`),`tail -f` 会实时滚动出新日志。
@@ -663,9 +672,9 @@ tail -f 2026_08_01_ServerLog
 
 | # | 验证操作 | 预期结果 | 通过 |
 |---|---|---|---|
-| 1 | 启动服务器 | 当前目录生成 `2026_08_01_ServerLog`(日期为当天) | ☐ |
+| 1 | 启动服务器 | 当前目录生成 `{当天日期}_ServerLog`(如 `2026_08_03_ServerLog`) | ☐ |
 | 2 | `curl http://127.0.0.1:9006/welcome.html` | 200,日志新增 accept + 处理请求两行 | ☐ |
-| 3 | `tail -f 2026_08_01_ServerLog` 另开终端 | 发请求时日志实时滚动 | ☐ |
+| 3 | `tail -f *ServerLog` 另开终端 | 发请求时日志实时滚动 | ☐ |
 | 4 | 把 `init_log()` 里最后参数 1024 改成 0(同步模式)重启 | 功能一致,日志照常生成 | ☐ |
 | 5 | 用 `nc` 连上不发数据,等超时 | 日志出现 `定时器关闭空闲连接` | ☐ |
 | 6 | 日志格式 | 每行都有 `日期 时间.微秒 [级别]:` 前缀 | ☐ |
@@ -689,8 +698,8 @@ gdb ./build/server
 ### 用 grep 过滤日志
 
 ```bash
-grep "error" 2026_08_01_ServerLog      # 只看错误
-grep "accept" 2026_08_01_ServerLog     # 只看连接
+grep "error" *ServerLog                # 只看错误
+grep "accept" *ServerLog               # 只看连接
 ```
 
 ## 10. 常见坑
@@ -700,7 +709,7 @@ grep "accept" 2026_08_01_ServerLog     # 只看连接
 | 日志文件没生成 | 工作目录不对(没在 `my_tiny_webserver/` 下运行) | `cd` 到项目目录再启动 |
 | 日志文件生成了但**内容为空** | 异步模式 + 直接调 `write_log` 没调 `flush()` | 用 `LOG_INFO` 等宏(宏里带 flush),或手动 `flush()` |
 | `LOG_INFO` 报 `m_close_log was not declared` | main 里没定义全局 `m_close_log` | `int m_close_log = 0;` 加在 main 顶部 |
-| 编译报 `timewait` 未定义 | locker.h 还是 S3 的简化版 | 换成原版 `lock/locker.h` |
+| 编译报 `timewait` 未定义(只有换了带超时 `pop` 的原版 block_queue 才会遇到) | locker.h 还是 S3 的简化版 | 换成原版 `lock/locker.h` |
 | 换天后日志还写在旧文件 | `m_today` 判定跨天 | 代码已处理(跨天换新文件),重启服务器验证 |
 | 日志乱码 | 中文字符编码 | 日志内容尽量用英文,或终端 UTF-8 |
 
@@ -708,16 +717,16 @@ grep "accept" 2026_08_01_ServerLog     # 只看连接
 
 | 本阶段 | 原项目 |
 |---|---|
-| `log/block_queue.h` | **逐字一致** |
-| `log/log.h` + `log.cpp` | **逐字一致** |
-| `lock/locker.h`(换回原版) | **逐字一致** |
+| `log/block_queue.h`(简化版) | 缺 `front()/back()/max_size()` 和带超时的 `pop(T&, int ms_timeout)`;S9 换原版 |
+| `log/log.h` + `log.cpp` | **代码一致**(注释按教学需要略有改写) |
+| `lock/locker.h`(换回原版) | **代码一致** |
 | main 里的 `init_log` + `LOG_INFO` | 对应 `webserver.cpp` 的 `log_write()` 和散布各处的 `LOG_*` 调用 |
 | 用 `m_close_log = 0` 全局变量 | 原项目在 `WebServer`/`http_conn` 类里有自己的 `m_close_log` 成员 |
 
 > **diff 对照**:
 > ```bash
 > diff my_tiny_webserver/log/log.cpp log/log.cpp
-> diff my_tiny_webserver/log/block_queue.h log/block_queue.h
+> diff my_tiny_webserver/log/block_queue.h log/block_queue.h   # 会看到差异:少了 front/back/max_size 和超时 pop
 > ```
 
 ## 12. 下一步

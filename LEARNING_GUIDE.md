@@ -1,5 +1,7 @@
 # TinyWebServer 学习路线
 
+> 💡 想**从零逐步复现**本项目?请走主教程 [tutorial/README.md](tutorial/README.md)——分 9 个阶段、每阶段带完整可编译代码与验收清单。本文档是**模块视角的快速导读**,适合已经能跑通项目、想按模块精读代码或准备面试时使用。文中"教程 Stage N"即主教程对应阶段。
+
 ## 先看整体
 
 这个项目是一台 Linux 下的轻量级 C++ Web 服务器。主线是：
@@ -16,7 +18,7 @@
 
 ### 1. 启动流程
 
-从 `main.cpp` 开始，重点看 6 个步骤：
+从 `main.cpp` 开始，重点看 7 个步骤（教程 Stage 9 有这 7 步的完整讲解）：
 
 - `Config::parse_arg`
 - `WebServer::init`
@@ -30,7 +32,7 @@
 
 ### 2. 事件循环
 
-重点阅读 `webserver.cpp`：
+重点阅读 `webserver.cpp`（教程 Stage 4 先学概念、Stage 9 看完整实现）：
 
 - `eventListen`：socket、bind、listen、epoll、信号管道、alarm
 - `eventLoop`：epoll_wait 后分发事件
@@ -49,7 +51,7 @@
 
 ### 3. HTTP 状态机
 
-重点阅读 `http/http_conn.cpp`：
+重点阅读 `http/http_conn.cpp`（教程 Stage 5 全文逐段讲解）：
 
 - `read_once`：LT/ET 两种模式下如何读 socket
 - `parse_line`：按 CRLF 切行
@@ -65,7 +67,7 @@
 
 ### 4. 并发模型
 
-看 `threadpool/threadpool.h` 和 `webserver.cpp` 的读写分支：
+看 `threadpool/threadpool.h` 和 `webserver.cpp` 的读写分支（教程 Stage 3 讲线程池、Stage 9 讲两种模型的真实代码）：
 
 - Proactor：主线程先读 socket，再把已读好的请求交给工作线程处理
 - Reactor：主线程只投递事件，工作线程自己读或写 socket
@@ -78,7 +80,7 @@
 
 ### 5. 资源管理
 
-按这个顺序看支撑模块：
+按这个顺序看支撑模块（分别对应教程 Stage 3/8/6/7）：
 
 - `lock/locker.h`：互斥锁、信号量、条件变量封装
 - `CGImysql/sql_connection_pool.cpp`：连接池的取出和归还
@@ -103,4 +105,6 @@
 - 定时器为什么要和连接 fd 绑定？
 - MySQL 连接池为什么用 RAII 包装？
 - 异步日志的阻塞队列解决了什么问题？
+
+> 以上问题在教程中都有对应章节讲解。**想从零动手复现 → [tutorial/README.md](tutorial/README.md)**。
 

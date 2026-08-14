@@ -9,7 +9,7 @@
 - [ ] 知道 `std::move` 是干嘛的(简述)
 - [ ] 运行示例程序 + 完成 1 道练习
 
-**铺路说明:** 项目里 `block_queue.h` 用范围 for 释放线程;`http_conn` 的 `users` 全局 map 赋值用了 `pair`;lambda 在 C++11 版实现里常用于回调。这些是最后一层语法垫脚石。
+**铺路说明:** 项目里 `threadpool.h` 用 `while` 循环让工作线程轮询任务队列;`http_conn.cpp` 的全局用户表 `users` 赋值用了 `pair`;lambda 在 C++11 版实现里常用于回调。这些是最后一层语法垫脚石。
 
 ## 2. nullptr / auto / 范围 for
 

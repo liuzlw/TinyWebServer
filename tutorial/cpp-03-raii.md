@@ -83,7 +83,7 @@ public:
 
 - 内部用**引用计数**:每复制一份计数 +1,每析构一份 -1
 - 计数归 0 时,最后一个 `shared_ptr` 负责 `delete`
-- 项目里 `sql_connection_pool` 就是用 `shared_ptr` 管理连接归还
+- 项目里 SQL 连接池的"用完归还"用的是一个自研的 `connectionRAII` 包装类(构造借连接、析构还连接,思路和 shared_ptr 的"析构自动释放"一模一样),不是标准库指针——这个在 Stage 8 会看到。这里先用 `shared_ptr` 把"析构自动释放"的思想学透
 
 ## 5. 示例程序
 

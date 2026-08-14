@@ -11,6 +11,19 @@ Linux下C++轻量级Web服务器，助力初学者快速实践网络编程，搭
 * 经Webbench压力测试可以实现**上万的并发连接**数据交换
 
 
+📖 本仓库文档导航
+----
+本仓库有三份文档，用途不同，别走错门:
+
+| 文档 | 用途 |
+|---|---|
+| [tutorial/README.md](tutorial/README.md) | **主教程**:从零分 9 个阶段复现本项目(环境 → C++ 基础 → 服务器阶段 → 附录)，每阶段含完整可编译代码与验收清单。**初学者从这里开始** |
+| [LEARNING_GUIDE.md](LEARNING_GUIDE.md) | **快速导读**:模块视角的阅读顺序 + 面试自测题，适合已能跑通项目、想精读代码或准备面试 |
+| 本文档 | 上游项目说明:框架、演示、压测结果、运行参数 |
+
+> 教程使用独立的 `my_tiny_webserver/` 作为复现工作区，本仓库代码即"参考答案";构建与运行参数见下文"快速运行/个性化运行"。
+
+
 写在前面
 ----
 * 本项目开发维护过程中，很多童鞋曾发红包支持，我都一一谢绝。我现在不会，将来也不会将本项目包装成任何课程售卖，更不会开通任何支持通道。
@@ -40,7 +53,7 @@ Linux下C++轻量级Web服务器，助力初学者快速实践网络编程，搭
 > * [同步/异步日志系统 ](https://github.com/qinguoyi/TinyWebServer/tree/master/log)  
 > * [数据库连接池](https://github.com/qinguoyi/TinyWebServer/tree/master/CGImysql) 
 > * [同步线程注册和登录校验](https://github.com/qinguoyi/TinyWebServer/tree/master/CGImysql) 
-> * [简易服务器压力测试](https://github.com/qinguoyi/TinyWebServer/tree/master/test_presure)
+> * [简易服务器压力测试](https://github.com/qinguoyi/TinyWebServer/tree/master/test_pressure)
 
 
 框架
@@ -136,14 +149,14 @@ Demo演示
 	* FireFox
 	* 其他浏览器暂无测试
 
-* 测试前确认已安装MySQL数据库
+* 测试前确认已安装MySQL数据库(本仓库默认使用库 `qgydb`、用户 `root/root`;建库建表步骤见教程 [Stage 0](tutorial/stage-00-environment.md))
 
     ```C++
-    // 建立yourdb库
-    create database yourdb;
+    // 建立qgydb库
+    create database qgydb;
 
     // 创建user表
-    USE yourdb;
+    USE qgydb;
     CREATE TABLE user(
         username char(50) NULL,
         passwd char(50) NULL
@@ -153,13 +166,13 @@ Demo演示
     INSERT INTO user(username, passwd) VALUES('name', 'passwd');
     ```
 
-* 修改main.cpp中的数据库初始化信息
+* 确认main.cpp中的数据库初始化信息(默认已配置 `qgydb`/`root`/`root`,按需修改)
 
     ```C++
     //数据库登录名,密码,库名
     string user = "root";
     string passwd = "root";
-    string databasename = "yourdb";
+    string databasename = "qgydb";
     ```
 
 * build

@@ -43,7 +43,7 @@ Host: 127.0.0.1:9006\r\n            ← 请求头(可有多个)
 ```text
 HTTP/1.1 200 OK\r\n                 ← 状态行:版本 + 状态码 + 说明
 Content-Type: text/html\r\n         ← 响应头:告诉浏览器内容类型
-Content-Length: 98\r\n              ← 响应头:body 字节数
+Content-Length: 98\r\n              ← 响应头:body 字节数(此处对应下面示例文件的大小)
 \r\n                                ← 空行
 <html>...</html>                    ← body:真正的网页内容
 ```
@@ -90,7 +90,12 @@ write() 发回响应 → close
 </html>
 ```
 
-> 想测试图片、视频等更多文件?可以把原仓库的静态文件拷过来:`cp -r ../root/* root/`(在原仓库里运行,`../root` 就是原项目的资源目录)。本阶段先保证文本文件跑通。
+> **再把原仓库的静态文件拷进来**(这一步是**必做**的——后面的 Stage 5/8 验收要用 `register.html`、`picture.gif`、`test1.jpg` 等,现在拷齐免得以后回来补)。**在 `my_tiny_webserver/` 下运行**:
+> ```bash
+> cp -r ../root/* root/
+> ls root/        # 应能看到 welcome.html、judge.html、picture.gif、test1.jpg 等
+> ```
+> `../root` 就是原仓库的 `root/`(上一级目录)。注意拷入后 `root/welcome.html` 会被原版(750 字节)覆盖——第 6 节的 `Content-Length` 预期以实际字节数为准。
 
 **第二步:替换 `my_tiny_webserver/main.cpp`** 为:
 
@@ -254,6 +259,8 @@ curl -v http://127.0.0.1:9006/welcome.html
 ```
 
 `<` 开头的是服务器回的东西。**这就是你自己拼出来的合法 HTTP 响应。**
+
+> `Content-Length: 98` 对应的是上面我们自己写的那份 welcome.html(带末尾换行正好 98 字节)。如果你照第 5 节的提示**拷了原仓库的 `root/` 文件**(现在是必做步骤,原版 `welcome.html` 是 750 字节),`Content-Length` 会变成实际字节数——以你 `wc -c root/welcome.html` 数为准,别拿 98 对不上就以为是 bug。
 
 ### 在浏览器里看
 

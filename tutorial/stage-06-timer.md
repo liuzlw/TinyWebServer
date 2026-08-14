@@ -556,7 +556,14 @@ int main()
                 if (users[sockfd].read_once())
                 {
                     adjust_timer(sockfd);              // 有活动,顺延超时
+                    int before = http_conn::m_user_count;
                     users[sockfd].process();
+                    // process() 内部可能已经关闭了连接(比如请求的文件不存在,
+                    // process_write 返回 false → 直接 close_conn)。这时定时器还留在链表里:
+                    // 若 fd 被新连接复用,残留定时器 15 秒后 tick() 会误关新连接。
+                    // 所以连接数减少了就说明刚被 process() 关掉,立即删掉它的定时器。
+                    if (http_conn::m_user_count < before)
+                        timer_lst.del_timer(users_timer[sockfd].timer);
                 }
                 else
                 {
@@ -594,6 +601,8 @@ int main()
 | 连接关闭 | `timer_lst.del_timer(...)`——移除定时器 |
 | SIGALRM 到达 | `timer_lst.tick()`——关闭所有已到期连接 |
 
+> ⚠️ **一个容易漏的关闭时机**:`process()` 内部也可能自己关连接(请求的文件不存在时),这时连接数 `m_user_count` 会减少 1。主循环里 `process()` 之后要检测这一点并删定时器(见上方 EPOLLIN 分支),否则残留定时器在 fd 被新连接复用后会误关新连接。
+
 ## 8. 编译与运行
 
 更新 `CMakeLists.txt`(加入 `timer/lst_timer.cpp`):
@@ -622,9 +631,20 @@ cmake --build build
 |---|---|---|---|
 | 1 | `curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9006/welcome.html` | `200`(功能未破坏) | ☐ |
 | 2 | **空闲连接被关**:`nc 127.0.0.1 9006` 连上后**不发任何数据**,等约 20 秒 | nc 提示连接关闭/EOF,服务器日志出现 `定时器关闭空闲连接` | ☐ |
-| 3 | **活跃连接不误关**:写个脚本每 4 秒发一次 `GET ... keep-alive` 请求,持续 20 秒 | 每次都收到 200,连接不被关(日志无 `定时器关闭` 或间隔正确) | ☐ |
+| 3 | **活跃连接不误关**:用**同一个 TCP 连接**每 4 秒发一次 keep-alive 请求,持续约 20 秒(命令见下) | 输出 `6`(6 次都收到 `HTTP/1.1 200`,连接没被定时器关) | ☐ |
 | 4 | 连接正常关闭(发完请求就断开) | 日志无 `定时器关闭`(是正常 `close`) | ☐ |
 | 5 | `Ctrl+C` 停止服务器 | 服务器正常退出(没被信号搞死) | ☐ |
+
+**第 3 条的命令**(用同一个连接,6 次请求间隔 4 秒,总时长约 20 秒):
+
+```bash
+{ for i in 1 2 3 4 5 6; do
+      printf "GET /welcome.html HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"
+      sleep 4
+  done; } | nc 127.0.0.1 9006 | grep -o "HTTP/1.1 200" | wc -l
+```
+
+输出应为 `6`。原理:每次请求都会 `adjust_timer` 把超时顺延 15 秒,所以 4 秒一次的间隔永远不会触发 `tick()` 关闭;如果输出小于 6,说明活跃连接被定时器误关了(或 keep-alive 处理有问题)。注意这条用的是**同一个** `nc` 连接(管道里的 6 次请求走同一连接),和"每 4 秒新开一个 curl"是两回事。
 
 > 第 2 条等待约 20 秒即可(超时设的是 3×5=15 秒,扫描是每 5 秒一次,实际在 15~20 秒之间触发)。想加快调试,可以把 `TIMESLOT` 改成 1(超时 3 秒)。
 
@@ -637,7 +657,7 @@ gdb ./build/server
 ```
 
 ```text
-(gdb) break timer/lst_timer.cpp:96      ← 断在 tick()
+(gdb) break timer/lst_timer.cpp:96      ← 断在 tick()(以你代码的实际行号为准)
 (gdb) run
 (gdb) print head->expire                ← 看链表头结点的到期时刻
 $1 = 1750000000

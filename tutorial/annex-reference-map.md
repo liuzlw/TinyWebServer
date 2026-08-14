@@ -45,7 +45,8 @@ TinyWebServer/
 │   └── README.md
 ├── root/                         # 静态资源(Stage 2 起)
 ├── test_pressure/
-│   └── README.md                 # 压测说明
+│   ├── README.md                 # 压测说明
+│   └── webbench-1.5/             # webbench 源码(Stage 9 就地编译)
 ├── makefile                      # 原项目构建(附录 A1)
 └── build.sh                      # 构建脚本(make server)
 ```

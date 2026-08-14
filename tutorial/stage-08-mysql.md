@@ -62,7 +62,7 @@ mysql_close(mysql);                                  // 5. 关闭
 
 ## 6. CGImysql/sql_connection_pool.h + .cpp
 
-在 `my_tiny_webserver/` 下新建 `CGImysql/sql_connection_pool.h`(**与原项目一致**):
+在 `my_tiny_webserver/` 下新建 `CGImysql/sql_connection_pool.h`(**代码与原项目一致,注释按教学需要改写**):
 
 ```cpp
 #ifndef _CONNECTION_POOL_
@@ -93,6 +93,14 @@ public:
 
 	void init(string url, string User, string PassWord, string DataBaseName, int Port, int MaxConn, int close_log); 
 
+	//配置成员:init() 里赋值,建连接时要用(与原项目一致)
+	string m_url;           //主机地址
+	string m_Port;          //数据库端口号
+	string m_User;          //登录数据库用户名
+	string m_PassWord;      //登录数据库密码
+	string m_DatabaseName;  //使用数据库名
+	int m_close_log;        //日志开关
+
 private:
 	connection_pool();
 	~connection_pool();
@@ -119,7 +127,7 @@ private:
 #endif
 ```
 
-在 `my_tiny_webserver/CGImysql/` 下新建 `sql_connection_pool.cpp`(**与原项目一致**):
+在 `my_tiny_webserver/CGImysql/` 下新建 `sql_connection_pool.cpp`(**代码与原项目一致,注释按教学需要改写**):
 
 ```cpp
 #include <mysql/mysql.h>
@@ -282,9 +290,12 @@ S5 的 http_conn 把 MySQL 部分删掉了,现在补回来。**改动集中在 3
 在 include 区加:
 
 ```cpp
+#include <map>
 #include "../lock/locker.h"
 #include "../CGImysql/sql_connection_pool.h"
 ```
+
+> `#include <map>` 别忘了加:下面要用 `map<string, string>`,而 S5 的 http_conn.h 里没有它。
 
 在 public 方法区加:
 
@@ -309,21 +320,48 @@ MYSQL *mysql;              // 当前连接用的数据库连接
 
 ```cpp
 map<string, string> m_users;   // 用户名→密码 内存表
-int m_TRIGMode;
 int m_close_log;
 char sql_user[100];
 char sql_passwd[100];
 char sql_name[100];
 ```
 
+> 注意:**`int m_TRIGMode;` 不用再加**——S5 的 http_conn.h 里已经有了(见 Stage 5 §5)。再加会重复声明报错。
+
+**还有一处别漏:`http_conn.cpp` 里的 `init()` 实现也要同步改成 8 参数**(只改头文件声明、不改实现,链接会报 `undefined reference to http_conn::init`)。把 S5 的 `init` 替换成:
+
+```cpp
+//S8 起 init 变成 8 参数:多存了数据库账号密码,注册/登录时要用
+void http_conn::init(int sockfd, const sockaddr_in &addr, char *root, int TRIGMode,
+                     int close_log, string user, string passwd, string sqlname)
+{
+    m_sockfd = sockfd;
+    m_address = addr;
+
+    doc_root = root;
+    m_TRIGMode = TRIGMode;              // 先赋值再注册进 epoll(见下面注释)
+    m_close_log = close_log;
+
+    strcpy(sql_user, user.c_str());     // 存数据库账号,注册/登录时 do_request 要用
+    strcpy(sql_passwd, passwd.c_str());
+    strcpy(sql_name, sqlname.c_str());
+
+    init();                             // 清空缓冲区、复位状态机(S5 已写过)
+    addfd(m_epollfd, sockfd, true, m_TRIGMode);
+    m_user_count++;
+}
+```
+
+> ⚠️ **注意顺序**:S5 的 `init` 里是 `addfd(...)` 在 `m_TRIGMode = TRIGMode` **之前**调用——这时 `m_TRIGMode` 还是未初始化(垃圾值)的成员,如果垃圾值不是 1,ET 模式的连接会被错误地按 LT 注册。这里是原项目的写法,我们顺手把它修正(先赋值、后注册)。
+
 ### ② http_conn.cpp:顶部加全局 + 实现 initmysql_result
 
 ```cpp
 // 全局:注册/登录校验用的用户名密码表 + 保护它的锁
 locker m_lock;
-map<string, string> users;
+map<string, string> user_map;
 
-//从数据库加载全部用户名密码到 users 表
+//从数据库加载全部用户名密码到 user_map 表
 void http_conn::initmysql_result(connection_pool *connPool)
 {
     MYSQL *mysql = NULL;
@@ -342,12 +380,14 @@ void http_conn::initmysql_result(connection_pool *connPool)
     {
         string temp1(row[0]);   // username
         string temp2(row[1]);   // passwd
-        users[temp1] = temp2;   // 存进内存表
+        user_map[temp1] = temp2;   // 存进内存表
     }
 }
 ```
 
-> **为什么启动时把整个 user 表加载进内存?** 登录/注册查 `users` map 比每次查数据库快得多。注册时新增的行也会同步插进 map(见下方 do_request)。
+> **为什么叫 `user_map` 而不是 `users`?** 原项目的全局用户名表就叫 `users`,但我们的 main.cpp 从 S7 起已经用 `users` 命名了 `http_conn` 数组(`http_conn *users = new http_conn[MAX_FD]`)。两个全局同名符号会链接报 `multiple definition of 'users'`,所以这里先改名避开。到 S9 换原版后,http_conn 数组会变成 `WebServer` 的成员(`webserver.h` 里),不再占用全局名 `users`,届时恢复原版写法即可。
+>
+> **为什么启动时把整个 user 表加载进内存?** 登录/注册查 `user_map` 比每次查数据库快得多。注册时新增的行也会同步插进 map(见下方 do_request)。
 
 ### ③ http_conn.cpp:`do_request` 恢复 cgi 注册/登录分支
 
@@ -365,14 +405,17 @@ S5 里这段被删了,现在把原版加回到 `do_request` 的 `strrchr(m_url, 
         strncpy(m_real_file + len, m_url_real, FILENAME_LEN - len - 1);
         free(m_url_real);
 
-        //从 body 里提取用户名密码:格式 user=123&passwd=123
+        //从 body 里提取用户名密码:格式 user=123&password=123(字段名和 register.html 表单一致)
         char name[100], password[100];
         int i;
+        // 魔法数 5 = 跳过 "user="(5 个字符)
         for (i = 5; m_string[i] != '&'; ++i)
             name[i - 5] = m_string[i];
         name[i - 5] = '\0';
 
         int j = 0;
+        // 魔法数 10 = 跳过 "&password="(1 + 8 + 1 个字符)。注意表单字段是 password(8 字符),
+        // 不是 passwd(6 字符)——如果手写 curl 时用了 passwd=,这里会多跳 2 个字符,密码解析错
         for (i = i + 10; m_string[i] != '\0'; ++i, ++j)
             password[j] = m_string[i];
         password[j] = '\0';
@@ -388,11 +431,11 @@ S5 里这段被删了,现在把原版加回到 `do_request` 的 `strrchr(m_url, 
             strcat(sql_insert, password);
             strcat(sql_insert, "')");
 
-            if (users.find(name) == users.end())   // 没有同名
+            if (user_map.find(name) == user_map.end())   // 没有同名
             {
                 m_lock.lock();
                 int res = mysql_query(mysql, sql_insert);          // 插入数据库
-                users.insert(pair<string, string>(name, password)); // 更新内存表
+                user_map.insert(pair<string, string>(name, password)); // 更新内存表
                 m_lock.unlock();
 
                 if (!res)
@@ -406,7 +449,7 @@ S5 里这段被删了,现在把原版加回到 `do_request` 的 `strrchr(m_url, 
         else if (*(p + 1) == '2')
         {
             //登录:名字密码都对 → 欢迎页
-            if (users.find(name) != users.end() && users[name] == password)
+            if (user_map.find(name) != user_map.end() && user_map[name] == password)
                 strcpy(m_url, "/welcome.html");
             else
                 strcpy(m_url, "/logError.html");
@@ -417,11 +460,11 @@ S5 里这段被删了,现在把原版加回到 `do_request` 的 `strrchr(m_url, 
 **这段代码的"骨架"一目了然:**
 
 ```text
-POST /2CGISQL.cgi (登录) → 查 users[name] == password ? 欢迎页 : 错误页
-POST /3CGISQL.cgi (注册) → users 里没这名字? INSERT + 更新内存表 : 重名错误页
+POST /2CGISQL.cgi (登录) → 查 user_map[name] == password ? 欢迎页 : 错误页
+POST /3CGISQL.cgi (注册) → user_map 里没这名字? INSERT + 更新内存表 : 重名错误页
 ```
 
-`m_string` 是 S5 状态机解析出的 POST body(`user=xxx&passwd=xxx`),这里手动按 `&` 拆出用户名和密码。
+`m_string` 是 S5 状态机解析出的 POST body(`user=xxx&password=xxx`),这里手动按 `&` 拆出用户名和密码。字段名必须是 `password`(和 `register.html` 里的 `<input name="password">` 一致)。
 
 ## 8. main.cpp:初始化连接池 + 处理前借连接
 
@@ -467,9 +510,14 @@ else if (events[i].events & EPOLLIN)
     if (users[sockfd].read_once())
     {
         adjust_timer(sockfd);
+        int before = http_conn::m_user_count;
         // 处理前从连接池取一个连接(RAII:这个作用域结束时自动还回池子)
         connectionRAII mysqlcon(&users[sockfd].mysql, m_connPool);
         users[sockfd].process();
+        // process() 内部可能已关闭连接(文件不存在/校验失败),连接数减少说明刚被关掉,
+        // 要同步删掉它的定时器,否则 fd 复用后残留定时器会误关新连接(Stage 6 讲过)。
+        if (http_conn::m_user_count < before)
+            timer_lst.del_timer(users_timer[sockfd].timer);
         LOG_INFO("处理连接 %d 的请求", sockfd);
     }
     ...
@@ -530,9 +578,11 @@ mysql -u root -proot -e "USE qgydb; SHOW TABLES;"   # 应有 user 表
 | 5 | 再注册一个**同名**用户 | 提示注册失败(registerError) | ☐ |
 | 6 | 登录时输错密码 | 跳转 `logError.html` | ☐ |
 | 7 | 注册/登录后重启服务器 | 之前注册的账号仍能登录(数据已持久化) | ☐ |
-| 8 | `curl -X POST -d "user=abc&passwd=123" http://127.0.0.1:9006/3CGISQL.cgi` | 返回 log.html(注册成功跳登录页) | ☐ |
+| 8 | `curl -X POST -d "user=abc&password=123" http://127.0.0.1:9006/3CGISQL.cgi` | 返回 log.html(注册成功跳登录页) | ☐ |
 
-> 第 7 条验证了**数据真的写进了数据库**(重启后 `users` map 从数据库重新加载,账号还在)。
+> 第 8 条的字段名是 `password`(**不是** `passwd`):服务器按 `&password=` 的 10 个字符偏移解析 body(见 §7 ③),字段名写错会导致密码解析错、后续登录失败。浏览器里 `register.html` 的输入框名字就是 `password`,所以表单提交没问题。
+
+> 第 7 条验证了**数据真的写进了数据库**(重启后 `user_map` 从数据库重新加载,账号还在)。
 
 ## 11. 调试技巧
 
@@ -573,14 +623,14 @@ mysql -u root -proot qgydb -e "SELECT 1;"
 | `Access denied for user 'root'` | root 密码不是 root | 按 Stage 0 重新 `ALTER USER` 设置 |
 | 注册成功但数据库查不到 | 表名/字段不对 | `DESCRIBE user;` 确认有 `username`/`passwd` 两列 |
 | 注册/登录没反应 | `mysql` 连接没借到 | 确认 `connectionRAII` 加在了 `process()` 之前 |
-| 登录总是跳 logError | 内存表 `users` 没加载 | 确认 `init_sql()` 里调了 `users[0].initmysql_result(m_connPool)` |
+| 登录总是跳 logError | 内存表 `user_map` 没加载 | 确认 `init_sql()` 里调了 `users[0].initmysql_result(m_connPool)` |
 
 ## 13. 与原项目对照
 
 | 本阶段 | 原项目 |
 |---|---|
-| `CGImysql/sql_connection_pool.h` + `.cpp` | **逐字一致** |
-| `http_conn` 的 initmysql_result + cgi 分支 | 与原项目 `http_conn.cpp` **对应位置逐字一致** |
+| `CGImysql/sql_connection_pool.h` + `.cpp` | **代码一致**(注释按教学需要略有改写) |
+| `http_conn` 的 initmysql_result + cgi 分支 | 与原项目 `http_conn.cpp` **对应位置代码一致** |
 | main 里的 `init_sql` + `connectionRAII` | 对应 `webserver.cpp` 的 `sql_pool()` 与 `threadpool` 的 Reactor 分支 |
 
 > **diff 对照**:

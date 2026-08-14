@@ -297,10 +297,15 @@ cmake --build build
 
 ## 9. webbench 压力测试
 
-webbench 是原项目作者推荐的压测工具。原仓库 `test_pressure/` 只有 README,源码要另外获取:
+webbench 是原项目作者推荐的压测工具。原仓库 `test_pressure/webbench-1.5/` 就带着完整源码(webbench.c + Makefile),可以直接就地编译;想用官方 GitHub 仓库重新编译也行。**推荐就地编译**(不需要联网):
 
 ```bash
-# 在 WSL 里安装编译 webbench
+# 方案 A(推荐):用原仓库自带的 webbench-1.5 编译
+cd ~/TinyWebServer/test_pressure/webbench-1.5
+make
+sudo cp webbench /usr/local/bin/
+
+# 方案 B:从 GitHub 拉源码编译(和 A 等价)
 cd ~
 git clone https://github.com/EZLippi/WebBench.git
 cd WebBench
@@ -330,12 +335,12 @@ Copyright (c) Radim Kolar 1997-2004, GPL Open Source Software.
 Benchmarking: GET http://127.0.0.1:9006/
 1000 clients, running 5 sec.
 
-Speed=385000 pages/min, 42857 pages/sec,
-Pages: 1850000 bytes, 321428571 bytes/sec.
-Requests: 1850000 susceed, 0 failed.
+Speed=360000 pages/min, 6000 pages/sec,
+Requests: 30000 susceed, 0 failed.
 ```
 
 - `Requests: ... susceed, 0 failed.` ← **0 failed 是重点**,证明没有连接被丢
+- 上面的数字是"能自洽"的示例,不是你的机器能跑到的值:**`pages/sec × 60 = pages/min`、`pages/sec × 秒数 = susceed 数`**(6000×5=30000)。如果你跑出来对不上,说明压测中途有连接被断,值得查。
 - 你的机器跑出的 QPS 不设硬指标——项目 README 里作者在专用机器上跑到 9 万+ QPS,普通笔记本几千到几万都正常
 
 > 如果压测时服务器崩溃或大量 failed,通常是因为连接数超了 `ulimit -n` 或 ET 模式有 bug。先 `ulimit -n 65535` 再压。
@@ -349,7 +354,7 @@ Requests: 1850000 susceed, 0 failed.
 | 3 | 浏览器 `/0` 注册、`/1` 登录、`/5` 图片、`/6` 视频 | 全部正常(S8 + 静态功能) | ☐ |
 | 4 | `mysql ... SELECT * FROM user` | 能看到注册记录(持久化) | ☐ |
 | 5 | `nc` 空闲连接 20 秒 | 被定时器关闭,日志有 tick(S6) | ☐ |
-| 6 | `tail -f 2026_08_01_ServerLog` | 请求/连接日志滚动(S7) | ☐ |
+| 6 | `tail -f *ServerLog` | 请求/连接日志滚动(S7) | ☐ |
 | 7 | 并发两个 curl | 同时响应(线程池) | ☐ |
 | 8 | `./build/server -m 0` 与 `-m 3` 对比 | 都能正常服务(LT/ET 都通) | ☐ |
 | 9 | `./build/server -a 0` 与 `-a 1` 对比 | 都能正常服务(Proactor/Reactor 都通) | ☐ |
@@ -401,7 +406,7 @@ gdb -p $(pgrep -f "build/server")
 **本阶段完成后,`my_tiny_webserver/` 应该和原项目基本一致。** diff 验证:
 
 ```bash
-cd /mnt/c/Users/liuzl/Documents/projects/TinyWebServer
+cd ~/TinyWebServer                  # Stage 0 建过软链接,等价于 /mnt/c/.../TinyWebServer
 diff my_tiny_webserver/webserver.cpp webserver.cpp          # 应无差异
 diff my_tiny_webserver/http/http_conn.cpp http/http_conn.cpp # 应无差异
 diff my_tiny_webserver/main.cpp main.cpp                     # 应无差异

@@ -275,14 +275,15 @@ void http_conn::init(int sockfd, const sockaddr_in &addr, char *root, int TRIGMo
     m_sockfd = sockfd;
     m_address = addr;
 
-    addfd(m_epollfd, sockfd, true, m_TRIGMode);
-    m_user_count++;
-
     doc_root = root;
-    m_TRIGMode = TRIGMode;
+    m_TRIGMode = TRIGMode;              // 先赋值,再拿去注册(见下方注释)
 
     init();
+    addfd(m_epollfd, sockfd, true, m_TRIGMode);   // 注册进 epoll
+    m_user_count++;
 }
+// 注意:把 addfd 挪到 m_TRIGMode 赋值之后——原版顺序是反的(addfd 在赋值之前,
+// 用的是未初始化的成员,垃圾值不是 1 时 ET 连接会被错按 LT 注册),这里修正了。
 
 //初始化新接受的连接
 void http_conn::init()
@@ -761,6 +762,58 @@ void http_conn::process()
 }
 ```
 
+> 💡 **`EPOLLONESHOT` 是干什么的?**
+>
+> **作用**:一个 fd 触发一次事件被处理后,内核就把它从就绪队列里"摘下来",在重新注册(EPOLL_CTL_MOD)之前**不再上报该 fd 的任何事件**。
+>
+> **为什么连接 fd 需要它?** 防止**多个线程同时处理同一个连接**。设想 S3 的线程池场景:某个连接同时可读又可写(EPOLLIN + EPOLLOUT 都就绪),`epoll_wait` 返回后如果没有 ONESHOT,可能有两个工作线程先后被同一个 fd 唤醒,各自去 read/write 同一个连接 → 数据错乱、状态机打架。加了 ONESHOT,第一个拿到该 fd 的线程处理完、用 `modfd` 重新注册后,别人才可能再碰它——**一个 fd 一次只归一个线程处理**。
+>
+> **注意**:监听 socket 与信号用的 `pipefd` **不开启** ONESHOT(它们由主线程独占,不需要防并发);只有会被工作线程轮流转的连接 fd 才开。
+>
+> 本阶段服务器还是单线程,ONESHOT 的作用要到 S9 把线程池装回来才真正体现,但代码从现在就按"线程池安全"的写法准备了。
+
+> 💡 **注意首页变了**:S2 的默认首页是 `welcome.html`;这里照抄原版后,访问 `/` 会跳 `judge.html`(一个判断"你是新用户还是老用户"的引导页)。这是原项目行为,不是 bug。
+
+### 三个核心函数走读(必看)
+
+**① `parse_line`——把字节流切成"一行"**
+
+它做的事:从 `m_checked_idx` 扫到 `m_read_idx`,找一行的结束符 `\r\n`,找到就把 `\r` 和 `\n` 都替换成 `\0`,返回 `LINE_OK`。替换成 `\0` 很关键:这样每一行就成了一个以 `\0` 结尾的 C 字符串,后面 `parse_request_line(text)` 拿 `text` 直接用 `strpbrk/strspn` 等字符串函数就能处理。
+
+四种返回:
+
+| 返回值 | 含义 | 场景 |
+|---|---|---|
+| `LINE_OK` | 完整找到一行,`\r\n` 已变 `\0` | 正常 |
+| `LINE_OPEN` | 数据不够成行(行尾了还没看到 `\n`,或扫完都没找到 `\r\n`) | **半包**,等下一轮 read |
+| `LINE_BAD` | 格式错误(裸 `\n` 前面不是 `\r`) | 非法请求 |
+
+**② `process_read`——主状态机循环**
+
+```cpp
+while ((m_check_state == CHECK_STATE_CONTENT && line_status == LINE_OK)
+       || ((line_status = parse_line()) == LINE_OK))
+```
+
+循环条件解释了为什么叫"两层状态机":普通请求头按"行"解析,所以靠 `parse_line()` 返回 `LINE_OK` 继续;但 POST 的 **body 不是按行切的**,所以到了 `CHECK_STATE_CONTENT` 阶段改看 `line_status`(由 `parse_content` 自己决定 body 是否读完)。
+
+循环体按 `m_check_state` 分派:
+
+- `CHECK_STATE_REQUESTLINE` → `parse_request_line(text)`。解析完把状态切到 `CHECK_STATE_HEADER`。
+- `CHECK_STATE_HEADER` → `parse_headers(text)`。`\r\n` 空行表示头部结束;若 `ret == GET_REQUEST` 说明请求完整,调 `do_request()` 把 URL 映射成文件。
+- `CHECK_STATE_CONTENT` → `parse_content(text)`(只处理 POST body)。body 读完返回 `GET_REQUEST` → `do_request()`;没读完把 `line_status = LINE_OPEN`,整个 while 退出,返回 `NO_REQUEST` 挂起。
+
+**③ `write`——writev 发送 + 字节记账**
+
+`writev` 一次发两块:头(`m_iv[0]`,在 `m_write_buf` 里)+ 文件(`m_iv[1]`,mmap 出来的)。难点是**记清楚发到哪了**,因为非阻塞 socket 一次 `writev` 可能只发出去一部分:
+
+1. `bytes_to_send == 0`:keep-alive 空转,`modfd` 改回 `EPOLLIN`、`init()` 复位,等下一个请求。
+2. `writev` 返回 `EAGAIN`:发送缓冲满了,改注册 `EPOLLOUT`,等下次可写再继续发(数据不会丢,还在缓冲区里)。
+3. `bytes_have_send >= m_iv[0].iov_len`:头已经发完,`m_iv[0].iov_len = 0`,`m_iv[1]` 指向文件里剩下的部分(从 `bytes_have_send - m_write_idx` 起)。这个偏移有点绕:头发完时 `bytes_have_send == m_write_idx`(写缓冲写了多少就发了多少),所以 `m_file_address + 0` 正好是文件开头。
+4. `bytes_to_send <= 0`:全部发完。keep-alive → `init()` 继续服务下一请求;否则返回 `false`,主循环关连接。
+
+**配合 gdb 理解**:在 `parse_line` 断点单步,观察 `m_checked_idx/m_read_idx` 怎么前进、`\r\n` 怎么变 `\0`;在 `process_read` 断点,看 `m_check_state` 从 0(REQUESTLINE)走到 2(CONTENT);在 `write` 断点,看 `bytes_have_send/bytes_to_send` 两个计数器如何驱动 `m_iv` 变化。
+
 ## 7. main.cpp:把 http_conn 接入 epoll 循环
 
 **替换 `my_tiny_webserver/main.cpp`**:
@@ -906,7 +959,9 @@ cmake --build build
 | 5 | **6MB 大文件**:`curl -s -o /dev/null -w "%{http_code} %{size_download}" http://127.0.0.1:9006/picture.gif` | `200 6053895` | ☐ |
 | 6 | **浏览器**:打开 `/welcome.html`、`/5`(图片页) | 页面正常,图片完整显示 | ☐ |
 
-> ⚠️ **关于缺失文件**:访问 `/nope.html` 时 `curl` 会得到 **502(Empty reply)**,而不是 404——**这是原项目的行为**,不是 bug。原代码 `process_write` 没有处理 `NO_RESOURCE`(文件不存在),直接关闭连接、不返回响应。想让它返回 404 页面,把 `process_write` 里 `case BAD_REQUEST` 和 `default` 之间的逻辑补上即可,但为了和"参考答案"一致,我们先保留原样。这个"坑"在面试里也常被问。
+> ⚠️ **关于缺失文件**:访问 `/nope.html` 时 `curl` 会报 `curl: (52) Empty reply from server`(此时 `%{http_code}` 是 `000`),而不是 404——**这是原项目的行为**,不是 bug。原代码 `process_write` 没有处理 `NO_RESOURCE`(文件不存在),直接关闭连接、不返回响应。想让它返回 404 页面,把 `process_write` 里 `case BAD_REQUEST` 和 `default` 之间的逻辑补上即可,但为了和"参考答案"一致,我们先保留原样。这个"坑"在面试里也常被问。
+>
+> 注意区分:**52 是 curl 的错误号**(对方关闭连接、没回任何报文),**不是 HTTP 状态码 502**——服务器压根没发状态行,自然没有 502 一说。
 
 ## 10. 调试技巧
 
@@ -939,8 +994,9 @@ $2 = 0x... "/welcome.html"
 |---|---|---|
 | 大文件(6MB)显示不完整 | `write` 没处理"一次 writev 发不完" | 代码里有 `bytes_have_send`/`bytes_to_send` 循环和 EAGAIN 分支,已处理 |
 | 页面反复刷新后连接越来越多不释放 | keep-alive 连接不关闭 | 正常现象;Stage 6 定时器专门清理空闲连接 |
-| `curl` 对缺失文件报 502 | 原项目 `process_write` 未处理 `NO_RESOURCE` | 见第 9 节说明,是原项目行为 |
+| `curl: (52) Empty reply from server`(http_code 是 000) | 原项目 `process_write` 未处理 `NO_RESOURCE`(文件不存在直接关连接,不回响应) | 见第 9 节说明,是原项目行为 |
 | 浏览器显示"连接被重置" | 网站根目录路径不对或响应格式出错 | 确认在 `my_tiny_webserver/` 下运行(有 `root/` 目录) |
+| `/0`、`/1`、`/5` 页面打不开(连接被重置) | `root/` 里没有 `register.html`、`picture.gif` 等静态文件 | 确认做过 Stage 2 的 `cp -r ../root/* root/`,`ls root/` 应能看到这些文件 |
 | POST 请求挂起不返回 | body 没读全,`parse_content` 一直返回 NO_REQUEST | 检查 `Content-Length` 是否正确传给服务器 |
 
 ## 12. 与原项目对照
@@ -950,7 +1006,7 @@ $2 = 0x... "/welcome.html"
 | `http_conn.h` / `http_conn.cpp` 主体 | **与 `http/` 目录基本一致** |
 | 去掉的部分 | `#include "sql_connection_pool.h"`、`MYSQL *mysql`、`initmysql_result`、`do_request` 的 cgi 注册/登录分支(Stage 8 补) |
 | 去掉的部分 | `LOG_INFO/LOG_ERROR` 日志调用(Stage 7 补) |
-| 去掉的部分 | `timer_flag`、`improv` 定时器相关字段(Stage 6 补) |
+| 去掉的部分 | `timer_flag`、`improv` 定时器相关字段(Stage 9 换原版时补——Stage 6 的定时器只加到主循环层面,不碰 http_conn 内部) |
 | `addfd/modfd/removefd` | 原项目定义在 `http_conn.cpp`(与这里一致) |
 | `process()` 里没有线程池 | 原项目由 `threadpool<http_conn>` 的工作线程调用 `process()`(Stage 9 补) |
 

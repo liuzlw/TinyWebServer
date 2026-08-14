@@ -40,7 +40,7 @@ accept 等一个连接 → 读请求 → 回响应 → close → 回到 accept �
 
 先看 C5 的原始用法:`mtx.lock()` / `mtx.unlock()` 手写配对,容易忘 unlock。原项目把三种同步原语各封装成一个类,靠析构自动释放。
 
-在 `my_tiny_webserver/` 下新建 `lock/locker.h`(**和原仓库同名同内容**):
+在 `my_tiny_webserver/` 下新建 `lock/locker.h`(**简化版**:缺原版的 `cond::timewait`,Stage 7 会换回原版):
 
 ```cpp
 #ifndef LOCKER_H
@@ -453,7 +453,7 @@ gdb ./build/server
 ```
 
 ```text
-(gdb) break main.cpp:73      ← 断在 pool.append(task) 附近
+(gdb) break main.cpp:73      ← 断在 pool.append(task) 附近(以你代码的实际行号为准)
 (gdb) run
 (gdb) info threads           ← 列出所有线程,应能看到 9 个
 ```
@@ -464,7 +464,7 @@ gdb ./build/server
   9 Thread 0x7f... (running) worker() at threadpool/threadpool.h:129
   8 Thread 0x7f... (running) worker() at threadpool/threadpool.h:129
   ...
-* 1 Thread 0x7f... (running) main() at main.cpp:76
+* 1 Thread 0x7f... (running) main() at main.cpp:76   ← 行号是示意,以实际为准
 ```
 
 `*` 标记当前线程,8 个 `worker()` 线程都停在 `m_queuestat.wait()` 上睡觉——**没任务时工作线程就是挂起状态**,这就是"半同步"的体现。
@@ -490,13 +490,13 @@ gdb ./build/server
 
 | 本阶段 | 原项目对应 |
 |---|---|
-| `lock/locker.h` | **逐字一致** | 
+| `lock/locker.h`(简化版) | 缺原版的 `cond::timewait`(带超时的条件等待)。这个接口要到 S7 的阻塞队列 `pop` 才需要,到时按 S7 的指引换回原版 |
 | `threadpool/threadpool.h`(简化版) | 原版在**同骨架上加了 3 样东西**:MySQL 连接池成员 `m_connPool`(S8)、actor 模型分支 `m_actor_model`(S4)、`request->read_once()/write()/process()` 三种调用(S5) |
 | `EchoTask::process()` | 原项目是 `http_conn::process()`,一个完整连接对象 |
 
 > **diff 对比命令**(在原仓库根目录运行):
 > ```bash
-> diff my_tiny_webserver/lock/locker.h lock/locker.h              # 应无输出(完全一致)
+> diff my_tiny_webserver/lock/locker.h lock/locker.h              # 会看到差异:我们缺 cond::timewait
 > diff my_tiny_webserver/threadpool/threadpool.h threadpool/threadpool.h  # 会看到我们简化掉的部分
 > ```
 

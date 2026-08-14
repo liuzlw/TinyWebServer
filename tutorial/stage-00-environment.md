@@ -67,7 +67,7 @@ sudo apt install -y build-essential cmake gdb git
 >
 > ⚠️ 如果 `g++` 报 `command not found`,通常是缺 `build-essential`,上面一条命令就能装齐。
 
-### 3.3 确认项目位置
+### 3.3 确认项目位置 + 建个短路径软链接
 
 原仓库代码在 Windows 的 `C:\Users\liuzl\Documents\projects\TinyWebServer`,在 WSL 里对应路径是:
 
@@ -77,6 +77,23 @@ ls
 ```
 
 你会看到 `main.cpp`、`webserver.cpp`、`http/`、`threadpool/` 等——这就是我们要复现的目标(也是你的"参考答案")。
+
+**建议现在建一个软链接 `~/TinyWebServer` 指向仓库**,后面所有阶段都用 `~/TinyWebServer/...` 这个短路径(不用每次敲一长串 `/mnt/c/...`):
+
+```bash
+ln -s /mnt/c/Users/liuzl/Documents/projects/TinyWebServer ~/TinyWebServer
+cd ~/TinyWebServer
+ls my_tiny_webserver        # 应该能看到 lock/ threadpool/ http/ timer/ log/ CGImysql/ root/ 空骨架目录
+```
+
+> 如果提示 `my_tiny_webserver` 不存在(比如克隆的仓库没带骨架),先手动创建,效果一样:
+> ```bash
+> mkdir -p my_tiny_webserver/{lock,threadpool,http,timer,log,CGImysql,root}
+> ```
+
+> 软链接只是仓库的"快捷方式",读写的是同一个物理目录——你的复现代码写进 `my_tiny_webserver/` 后,Windows 侧的 Git 也能看到。后续所有阶段的 `cd ~/TinyWebServer/my_tiny_webserver` 都建立在这一步之上。
+
+> ⚠️ **关于在 `/mnt/c` 上构建**:`/mnt/c` 是 Windows 的 drvfs 挂载,在上面跑 CMake 会明显偏慢,偶尔还有文件锁/权限报错。本教程默认就在这里工作(方便 Windows 侧 Git 直接看到),大多数情况下没问题。如果构建频繁报错或慢得受不了,可以改用"工作副本"方案:把仓库复制到 Linux 家目录里构建,做完再把成果拷回仓库(见第 8 节常见坑的说明)。两种方案二选一,别混用。
 
 ---
 
@@ -161,7 +178,7 @@ Hello TinyWebServer! x=42
 
 看到 `Hello TinyWebServer! x=42` 就成功了。如果哪一步报错,对照第 8 节的"常见坑"。
 
-> 💡 **CMake 到底干了什么?** `cmake -S . -B build` 生成构建脚本,`cmake --build build` 执行它们。你之后会经常看到这两条命令,记成"配置 + 构建"即可。想偷懒可以把它们写成 `build.sh`(后面会做)。
+> 💡 **CMake 到底干了什么?** `cmake -S . -B build` 生成构建脚本,`cmake --build build` 执行它们。你之后会经常看到这两条命令,记成"配置 + 构建"即可。想偷懒可以自己把它们写进一个 `build.sh`(里面一行 `cmake -S . -B build && cmake --build build`,`chmod +x build.sh`,之后 `./build.sh` 一键构建)。
 
 ---
 
@@ -291,6 +308,11 @@ EXIT;
 - `CREATE DATABASE qgydb`:建库,名字对应 `main.cpp` 里的 `databasename = "qgydb"`
 - `CREATE TABLE user`:建用户表,列名 `username`/`passwd` **必须和 Stage 8 的 SQL 完全一致**(原仓库用 `SELECT username,passwd FROM user`)
 
+> ⚠️ 如果 `ALTER USER ... mysql_native_password` 报 `Unknown plugin 'mysql_native_password'`,说明你装的是 MySQL 8.4+ / 9.x(该插件已移除)。改用默认插件即可,连接方式不变:
+> ```sql
+> ALTER USER 'root'@'localhost' IDENTIFIED BY 'root';
+> ```
+
 > ⚠️ 这段 SQL 敲错会报语法错误,注意分号结尾、列名拼写。出错就 `DROP TABLE user;` 重建,或 `DROP DATABASE qgydb;` 重来。
 
 ### 6.4 验证能连上
@@ -354,7 +376,7 @@ mysql -u root -proot -e "SHOW DATABASES;"
 | `Can't connect to local MySQL server through socket` | 服务没启动 | `sudo service mysql start` |
 | `Access denied for user 'root'@'localhost'` | root 密码不对 | 重新 `sudo mysql` 里执行 `ALTER USER` 那段 |
 | gdb 首次提示 `debuginfod` | 联网下载调试符号 | 按 `n` 回车,或用 `.gdbinit` 永久关闭 |
-| WSL 里 `/mnt/c/...` 的文件没权限写 | Windows 挂载目录权限 | 优先在 `~`(Linux 家目录)下建工程,复现工程再从仓库复制 |
+| WSL 里 `/mnt/c/...` 的文件没权限写,或构建报奇怪的锁/权限错误 | drvfs 挂载的权限/锁问题 | 改用工作副本:把仓库复制到 `~` 下构建(如 `cp -r /mnt/c/Users/liuzl/Documents/projects/TinyWebServer ~/ws_local`,之后 `cd ~/ws_local` 继续),完成后把 `my_tiny_webserver/` 拷回仓库 |
 
 ## 9. 下一步
 

@@ -170,7 +170,8 @@ max(3.5,1.2)=3.5
 ## 6. 项目里的模板:预告
 
 ```cpp
-// threadpool.h 里的类模板(真实代码,Stage 3 会讲)
+// threadpool.h 里的类模板(贴近真实,Stage 3 会讲;原版 append 还带第二个参数 int state,
+// 这里先看主干)
 template <typename T>
 class threadpool {
 public:
